@@ -136,8 +136,13 @@ export default function LoginScreen() {
         return;
       }
 
+      // Save token to AsyncStorage
+      if (data.token) {
+        await AsyncStorage.setItem("token", data.token);
+      }
+
       Alert.alert("Login Successful", "Welcome back!");
-      router.replace("/(tabs)");
+      router.replace("/");
     } catch (err) {
       console.error("Login Error:", err);
       Alert.alert(

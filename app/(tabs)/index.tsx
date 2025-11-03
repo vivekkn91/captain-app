@@ -3,12 +3,19 @@ import { StyleSheet, TouchableOpacity, ScrollView, ActivityIndicator, Alert, Vie
 import axios from 'axios';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useRouter } from 'expo-router';
+import { useNavigation, DrawerActions } from '@react-navigation/native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useColorScheme } from '@/hooks/use-color-scheme';
+import { Colors } from '@/constants/theme';
 
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 
 export default function HomeScreen() {
   const router = useRouter();
+  const navigation = useNavigation() as any;
+  const insets = useSafeAreaInsets();
+  const colorScheme = useColorScheme();
   const [availableTables, setAvailableTables] = useState<number[]>([]);
   const [selectedTable, setSelectedTable] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
@@ -79,6 +86,14 @@ export default function HomeScreen() {
 
   return (
     <ThemedView style={styles.container}>
+      {/* Header */}
+      {/* <View style={[styles.header, { paddingTop: Math.max(insets.top, 16) }]}>
+        <View style={styles.headerLeftSpacer} />
+        <ThemedText type="title" style={styles.headerTitle}>Tables</ThemedText>
+        <TouchableOpacity onPress={() => navigation?.dispatch?.(DrawerActions.openDrawer())} style={styles.menuButton}>
+          <ThemedText style={[styles.menuIcon, { color: Colors[colorScheme ?? 'light'].tint }]}>≡</ThemedText>
+        </TouchableOpacity>
+      </View> */}
       <ScrollView contentContainerStyle={styles.scrollContent}>
         <ThemedView style={styles.headerContainer}>
           <ThemedText type="title" style={styles.title}>
@@ -143,6 +158,30 @@ export default function HomeScreen() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
+  },
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#222',
+  },
+  headerLeftSpacer: {
+    width: 60,
+  },
+  headerTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+  },
+  menuButton: {
+    padding: 8,
+    width: 60,
+    alignItems: 'flex-end',
+  },
+  menuIcon: {
+    fontSize: 22,
+    fontWeight: '900',
   },
   scrollContent: {
     flexGrow: 1,

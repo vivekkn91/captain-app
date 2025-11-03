@@ -13,6 +13,7 @@ import {
 import axios from 'axios';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useRouter, useLocalSearchParams } from 'expo-router';
+import { useNavigation, DrawerActions } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { ThemedText } from '@/components/themed-text';
@@ -44,6 +45,7 @@ interface OrderItem {
 
 export default function OrderScreen() {
   const router = useRouter();
+  const navigation = useNavigation() as any;
   const params = useLocalSearchParams();
   const tableNumber = params.tableNumber ? parseInt(params.tableNumber as string) : null;
   const colorScheme = useColorScheme();
@@ -200,7 +202,7 @@ export default function OrderScreen() {
   return (
     <ThemedView style={styles.container}>
       {/* Header */}
-      <View style={[styles.header, { paddingTop: Math.max(insets.top, 16) }]}>
+      {/* <View style={[styles.header, { paddingTop: Math.max(insets.top, 16) }]}>
         <TouchableOpacity onPress={() => router.back()} style={styles.backButton}>
           <IconSymbol
             name="chevron.left"
@@ -212,8 +214,10 @@ export default function OrderScreen() {
         <ThemedText type="title" style={styles.headerTitle}>
           Table {tableNumber}
         </ThemedText>
-        <View style={styles.placeholder} />
-      </View>
+        <TouchableOpacity onPress={() => navigation?.dispatch?.(DrawerActions.openDrawer())} style={styles.menuButton}>
+          <ThemedText style={styles.menuIcon}>≡</ThemedText>
+        </TouchableOpacity>
+      </View> */}
 
       <ScrollView style={styles.scrollView} contentContainerStyle={styles.scrollContent}>
         {/* Category Dropdown */}
@@ -382,6 +386,16 @@ const styles = StyleSheet.create({
   },
   placeholder: {
     width: 60,
+  },
+  menuButton: {
+    padding: 8,
+    width: 60,
+    alignItems: 'flex-end',
+  },
+  menuIcon: {
+    fontSize: 22,
+    color: '#007AFF',
+    fontWeight: '900',
   },
   scrollView: {
     flex: 1,

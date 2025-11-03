@@ -1,16 +1,13 @@
+import 'react-native-gesture-handler';
 import {
   DarkTheme,
   DefaultTheme,
   ThemeProvider,
 } from "@react-navigation/native";
-import {
-  Stack,
-  useRootNavigationState,
-  useRouter,
-  useSegments,
-} from "expo-router";
+import { Stack } from "expo-router";
 import { StatusBar } from "expo-status-bar";
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import "react-native-reanimated";
 
 import { useColorScheme } from "@/hooks/use-color-scheme";
@@ -21,40 +18,57 @@ import { useColorScheme } from "@/hooks/use-color-scheme";
 
 export default function RootLayout() {
   const colorScheme = useColorScheme();
-  const segments = useSegments();
-  const router = useRouter();
-  const navigationState = useRootNavigationState();
+  
 
-  const [isLoggedIn, setIsLoggedIn] = useState(false); // You'll need to implement proper auth state management
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [isCheckingAuth, setIsCheckingAuth] = useState(true);
 
-  // useEffect(() => {
-  //   if (!navigationState?.key) return;
+  // Check authentication status on mount
+  useEffect(() => {
+    const checkAuth = async () => {
+      try {
+        const token = await AsyncStorage.getItem("token");
+        const serverIp = await AsyncStorage.getItem("server_ip");
+        
+        // User must have both token and server IP to be considered logged in
+        if (token && serverIp) {
+          setIsLoggedIn(true);
+        } else {
+          setIsLoggedIn(false);
+        }
+      } catch (err) {
+        console.error("Failed to check auth:", err);
+        setIsLoggedIn(false);
+      } finally {
+        setIsCheckingAuth(false);
+      }
+    };
+    
+    checkAuth();
+  }, []);
 
-  //   const isInAuthGroup = segments[0] === "screens";
+  // No imperative redirects; we'll select the initial route below
 
-  //   if (!isLoggedIn && !isInAuthGroup) {
-  //     // Redirect to the login screen if not logged in
-  //     router.replace("/screens/LoginScreen");
-  //   } else if (isLoggedIn && isInAuthGroup) {
-  //     // Redirect to the main app if logged in
-  //     router.replace("/(tabs)");
-  //   }
-  // }, [isLoggedIn, segments, navigationState?.key]);
+  // Show nothing while checking auth to prevent flash of wrong screen
+  if (isCheckingAuth) {
+    return null;
+  }
 
   return (
-    <ThemeProvider value={colorScheme === "dark" ? DarkTheme : DefaultTheme}>
-      <Stack>
-        <Stack.Screen
-          name="(tabs)"
-          options={{
-            headerShown: false,
-          }}
-        />
+    <ThemeProvider value={colorScheme === "dark" ? DarkTheme : DefaultTheme} >
+      <Stack initialRouteName={isLoggedIn ? "(drawer)" : "screens/LoginScreen"}>
+      <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
         <Stack.Screen
           name="screens/LoginScreen"
           options={{
             headerShown: false,
             presentation: "fullScreenModal",
+          }}
+        />
+        <Stack.Screen
+          name="(drawer)"
+          options={{
+            headerShown: false,
           }}
         />
       </Stack>
