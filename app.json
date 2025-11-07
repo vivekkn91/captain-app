@@ -20,7 +20,8 @@
       },
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
-      "package": "com.vivekkn91.billingkocaptian"
+      "package": "com.vivekkn91.billingkocaptian",
+      "usesCleartextTraffic": true
     },
     "web": {
       "output": "static",
@@ -39,7 +40,8 @@
             "backgroundColor": "#000000"
           }
         }
-      ]
+      ],
+      "./plugins/with-network-security-config.js"
     ],
     "experiments": {
       "typedRoutes": true,

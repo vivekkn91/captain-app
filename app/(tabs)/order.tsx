@@ -36,6 +36,7 @@ interface Product {
     name: string;
   };
   status: string;
+  Basequantity?: number | string;
 }
 
 interface OrderItem {
@@ -59,6 +60,9 @@ export default function OrderScreen() {
   const [orderItems, setOrderItems] = useState<OrderItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [categoryDropdownVisible, setCategoryDropdownVisible] = useState(false);
+  const [billNumber, setBillNumber] = useState<string | null>(null);
+  const [billNumberLoading, setBillNumberLoading] = useState<boolean>(false);
+  const [sequenceNumber, setSequenceNumber] = useState<number>(0);
 
   useEffect(() => {
     const loadApiUrl = async () => {
@@ -79,6 +83,28 @@ export default function OrderScreen() {
       fetchCategories();
       fetchProducts();
     }
+  }, [apiUrl]);
+
+  useEffect(() => {
+    const fetchBillNumber = async () => {
+      if (!apiUrl) return;
+      try {
+        setBillNumberLoading(true);
+        const token = await AsyncStorage.getItem('token');
+        const response = await axios.get(`${apiUrl}/api/billnumber/getBillNumber`, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+        setBillNumber(response.data.currentBillNumber);
+        setSequenceNumber(response.data.number);
+      } catch (err) {
+        console.error('Error fetching bill number:', err);
+      } finally {
+        setBillNumberLoading(false);
+      }
+    };
+    fetchBillNumber();
   }, [apiUrl]);
 
   useEffect(() => {
@@ -199,6 +225,111 @@ export default function OrderScreen() {
     }, 0);
   };
 
+  const updateBillNumber = async () => {
+    if (!apiUrl) return false;
+    try {
+      const token = await AsyncStorage.getItem('token');
+      const response = await axios.put(
+        `${apiUrl}/api/billnumber/updateBillNumber`,
+        { number: sequenceNumber + 1 },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+        }
+      );
+      if (response.status === 200 || response.status === 201) {
+        setOrderItems([]);
+        // Immediately refetch to get the new bill number string and sequence from server
+        try {
+          const refreshed = await axios.get(`${apiUrl}/api/billnumber/getBillNumber`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          setBillNumber(refreshed.data.currentBillNumber);
+          setSequenceNumber(refreshed.data.number);
+        } catch (err) {
+          // Fallback: bump local sequence if refetch fails
+          setSequenceNumber(sequenceNumber + 1);
+        }
+        return true;
+      }
+      return false;
+    } catch (err) {
+      console.error('Error updating bill number:', err);
+      return false;
+    }
+  };
+
+  const submitKOT = async () => {
+    if (!apiUrl) {
+      Alert.alert('Error', 'Server IP not configured. Please login first.');
+      return;
+    }
+    if (!tableNumber) {
+      Alert.alert('Select Table', 'Please select a table before submitting KOT.');
+      return;
+    }
+    if (!billNumber) {
+      Alert.alert('Bill Number Pending', 'Fetching bill number. Please try again in a moment.');
+      return;
+    }
+    if (orderItems.length === 0) {
+      Alert.alert('Empty Order', 'Add items to the order before submitting.');
+      return;
+    }
+    try {
+      setLoading(true);
+      const sanitizedItems = orderItems.map((item) => {
+        const price = (item.product as any)?.price ? Number((item.product as any).price) : 0;
+        return {
+          productId: item.product._id,
+          name: item.product.name,
+          quantity: item.quantity,
+          price: price,
+          subtotal: price * item.quantity,
+          Basequantity: 1,
+        };
+      });
+
+      const totalAmount = getTotalOrderCost();
+      const billData = {
+        billNumber,
+        paymentMethod: 'cash',
+        status: 'pending',
+        orderType: 'dine-in',
+        tableNumber: tableNumber,
+        table: tableNumber,
+        items: sanitizedItems,
+        totalAmount: totalAmount,
+        cgst: 0,
+        sgst: 0,
+        payableAmount: totalAmount,
+        date: new Date().toISOString(),
+      };
+
+      const token = await AsyncStorage.getItem('token');
+      const response = await axios.post(`${apiUrl}/api/bill/create`, billData, {
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+      });
+
+      if (response.status === 200 || response.status === 201) {
+        Alert.alert('Success', 'KOT submitted successfully!');
+        await updateBillNumber();
+        setOrderItems([]);
+        router.back();
+      }
+    } catch (err: any) {
+      console.error('Error creating bill:', err);
+      Alert.alert('Failed to create bill', err.response?.data?.message || err.message || 'Unknown error');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   return (
     <ThemedView style={styles.container}>
       {/* Header */}
@@ -292,6 +423,7 @@ export default function OrderScreen() {
                     onPress={() => handleAddToOrder(product)}
                   >
                     <ThemedText style={styles.productName}>{product.name}</ThemedText>
+                    <ThemedText style={styles.basequantity}>{product.Basequantity}</ThemedText>
                     <ThemedText style={styles.productCategory}>
                       ₹{(product as any)?.price ? Number((product as any).price).toFixed(2) : "N/A"}
                     </ThemedText>
@@ -318,7 +450,7 @@ export default function OrderScreen() {
                 <View style={styles.orderItemInfo}>
                   <ThemedText style={styles.orderItemName}>{item.product.name}</ThemedText>
                   <ThemedText style={styles.orderItemCategory}>
-                    {item.product.category.name}
+                    {item.product.Basequantity}
                   </ThemedText>
                   <ThemedText style={styles.orderItemPrice}>
                     ₹{((item.product as any)?.price ? Number((item.product as any).price) : 0).toFixed(2)} each
@@ -352,6 +484,22 @@ export default function OrderScreen() {
                 Total: ₹{getTotalOrderCost().toFixed(2)}
               </ThemedText>
             </View>
+            <TouchableOpacity
+              disabled={loading || billNumberLoading}
+              onPress={submitKOT}
+              style={[
+                styles.submitButton,
+                (loading || billNumberLoading) ? { opacity: 0.6 } : null,
+              ]}
+            >
+              {loading ? (
+                <ActivityIndicator color="#fff" />
+              ) : (
+                <ThemedText style={styles.submitButtonText}>
+                  {billNumber ? `Submit to KOT (Bill ${billNumber})` : 'Submit to KOT'}
+                </ThemedText>
+              )}
+            </TouchableOpacity>
           </View>
         )}
       </ScrollView>
@@ -459,6 +607,12 @@ const styles = StyleSheet.create({
   categoryOptionText: {
     fontSize: 16,
     color: '#000',
+  },
+  basequantity: {
+    fontSize: 12,
+    opacity: 0.7,
+    color: 'green',
+    marginBottom: 8,
   },
   checkmark: {
     fontSize: 18,
@@ -582,6 +736,18 @@ const styles = StyleSheet.create({
   totalCostLabel: {
     fontSize: 20,
     color: '#FFFFFF',
+  },
+  submitButton: {
+    marginTop: 12,
+    backgroundColor: '#34C759',
+    borderRadius: 12,
+    padding: 16,
+    alignItems: 'center',
+  },
+  submitButtonText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '600',
   },
   quantityControls: {
     flexDirection: 'row',
