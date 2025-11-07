@@ -1,8 +1,8 @@
-import React, { useEffect, useState } from 'react';
-import { StyleSheet, TouchableOpacity, ScrollView, ActivityIndicator, Alert, View } from 'react-native';
+import React, { useEffect, useState, useCallback } from 'react';
+import { StyleSheet, TouchableOpacity, ScrollView, ActivityIndicator, Alert, View, RefreshControl } from 'react-native';
 import axios from 'axios';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { useRouter } from 'expo-router';
+import { useRouter, useFocusEffect } from 'expo-router';
 import { useNavigation, DrawerActions } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useColorScheme } from '@/hooks/use-color-scheme';
@@ -17,8 +17,10 @@ export default function HomeScreen() {
   const insets = useSafeAreaInsets();
   const colorScheme = useColorScheme();
   const [availableTables, setAvailableTables] = useState<number[]>([]);
+  const [occupiedTables, setOccupiedTables] = useState<Set<number>>(new Set());
   const [selectedTable, setSelectedTable] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [apiUrl, setApiUrl] = useState<string | null>(null);
 
   useEffect(() => {
@@ -35,13 +37,7 @@ export default function HomeScreen() {
     loadApiUrl();
   }, []);
 
-  useEffect(() => {
-    if (apiUrl) {
-      fetchAvailableTables();
-    }
-  }, [apiUrl]);
-
-  const fetchAvailableTables = async () => {
+  const fetchAvailableTables = useCallback(async () => {
     if (!apiUrl) {
       Alert.alert('Error', 'Server IP not configured. Please login first.');
       return;
@@ -50,18 +46,78 @@ export default function HomeScreen() {
     setLoading(true);
     try {
       const token = await AsyncStorage.getItem('token');
-      const response = await axios.get(`${apiUrl}/api/tables/currentCount`, {
+      
+      // Fetch total table count
+      const tablesResponse = await axios.get(`${apiUrl}/api/tables/currentCount`, {
         headers: {
           Authorization: `Bearer ${token}`,
         },
       });
 
-      if (response.status === 200 && response.data.count >= 1) {
+      if (tablesResponse.status === 200 && tablesResponse.data.count >= 1) {
         // Generate an array from 1 to the count received
-        const tables = Array.from({ length: response.data.count }, (_, i) => i + 1);
-        setAvailableTables(tables);
+        const allTables = Array.from({ length: tablesResponse.data.count }, (_, i) => i + 1);
+
+        // Show ALL tables so waiters can manage existing orders
+        // Check each table to mark which ones have active orders (for visual indication)
+        setAvailableTables(allTables);
+        // Stop showing the loader immediately after count is known
+        setLoading(false);
+
+        // Check each table individually to see which ones are occupied (for visual indication only)
+        // Using getTableStatus endpoint which checks for active orders per table
+        try {
+          const occupiedStatuses = ['pending', 'preparing', 'ready'];
+          const occupiedTableNumbers: number[] = [];
+
+          // Check each table to see if it has an active order
+          const tableChecks = allTables.map(async (tableNum) => {
+            try {
+              const tableResponse = await axios.post(
+                `${apiUrl}/api/bill/getTableStatus`,
+                { tableNumber: tableNum },
+                {
+                  headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${token}`,
+                  },
+                }
+              );
+
+              // If status is 'success', table has an active order
+              // Check if the order status is in occupied statuses
+              if (tableResponse.data.status === 'success' && tableResponse.data.data) {
+                const billStatus = tableResponse.data.data.status;
+                if (occupiedStatuses.includes(billStatus)) {
+                  occupiedTableNumbers.push(tableNum);
+                }
+              }
+              // If status is 'table-free', table is available (don't add to occupiedTableNumbers)
+              // If status is 'success' but bill status is 'completed', 'bill-printed', or 'cancelled', table is available
+            } catch (tableErr: any) {
+              // If there's an error checking a table, assume it's available
+              // This ensures tables are shown even if API check fails
+            }
+          });
+
+          // Kick off in background; do not block initial render
+          Promise.all(tableChecks)
+            .then(() => {
+              const occupiedSet = new Set(occupiedTableNumbers);
+              setOccupiedTables(occupiedSet);
+            })
+            .catch((billsErr: any) => {
+              console.error('Error checking table statuses:', billsErr);
+              setOccupiedTables(new Set());
+            });
+        } catch (billsErr: any) {
+          // If there's a general error, just show all tables
+          console.error('Error checking table statuses:', billsErr);
+          setOccupiedTables(new Set());
+        }
       } else {
         setAvailableTables([]);
+        setOccupiedTables(new Set());
         Alert.alert('No Tables', 'No available tables found.');
       }
     } catch (err: any) {
@@ -71,10 +127,26 @@ export default function HomeScreen() {
         err.response?.data?.message || err.message || 'Please check your connection and try again.'
       );
       setAvailableTables([]);
+      setOccupiedTables(new Set());
     } finally {
       setLoading(false);
     }
-  };
+  }, [apiUrl]);
+
+  useEffect(() => {
+    if (apiUrl) {
+      fetchAvailableTables();
+    }
+  }, [apiUrl, fetchAvailableTables]);
+
+  // Refresh table availability when screen comes into focus
+  useFocusEffect(
+    useCallback(() => {
+      if (apiUrl) {
+        fetchAvailableTables();
+      }
+    }, [apiUrl, fetchAvailableTables])
+  );
 
   const handleTableSelect = (tableNumber: number) => {
     setSelectedTable(tableNumber);
@@ -94,7 +166,20 @@ export default function HomeScreen() {
           <ThemedText style={[styles.menuIcon, { color: Colors[colorScheme ?? 'light'].tint }]}>≡</ThemedText>
         </TouchableOpacity>
       </View> */}
-      <ScrollView contentContainerStyle={styles.scrollContent}>
+      <ScrollView 
+        contentContainerStyle={styles.scrollContent}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={async () => {
+              setRefreshing(true);
+              await fetchAvailableTables();
+              setRefreshing(false);
+            }}
+            tintColor="#007AFF"
+          />
+        }
+      >
         <ThemedView style={styles.headerContainer}>
           <ThemedText type="title" style={styles.title}>
             Select a Table
@@ -112,6 +197,9 @@ export default function HomeScreen() {
         ) : availableTables.length === 0 ? (
           <View style={styles.emptyContainer}>
             <ThemedText style={styles.emptyText}>No tables available</ThemedText>
+            <ThemedText style={styles.emptySubtext}>
+              All tables are currently occupied
+            </ThemedText>
             <TouchableOpacity style={styles.refreshButton} onPress={fetchAvailableTables}>
               <ThemedText style={styles.refreshButtonText}>Refresh</ThemedText>
             </TouchableOpacity>
@@ -119,35 +207,37 @@ export default function HomeScreen() {
         ) : (
           <ThemedView style={styles.tablesContainer}>
             <ThemedView style={styles.tableGrid}>
-              {availableTables.map((tableNumber) => (
-                <TouchableOpacity
-                  key={tableNumber}
-                  style={[
-                    styles.tableButton,
-                    selectedTable === tableNumber && styles.tableButtonSelected,
-                  ]}
-                  onPress={() => handleTableSelect(tableNumber)}
-                  activeOpacity={0.7}
-                >
-                  <ThemedText
+              {availableTables.map((tableNumber) => {
+                const isOccupied = occupiedTables.has(tableNumber);
+                return (
+                  <TouchableOpacity
+                    key={tableNumber}
                     style={[
-                      styles.tableButtonText,
-                      selectedTable === tableNumber && styles.tableButtonTextSelected,
+                      styles.tableButton,
+                      isOccupied && styles.tableButtonOccupied,
+                      selectedTable === tableNumber && styles.tableButtonSelected,
                     ]}
+                    onPress={() => handleTableSelect(tableNumber)}
+                    activeOpacity={0.7}
                   >
-                    {tableNumber}
-                  </ThemedText>
-                </TouchableOpacity>
-              ))}
+                    <ThemedText
+                      style={[
+                        styles.tableButtonText,
+                        isOccupied && styles.tableButtonTextOccupied,
+                        selectedTable === tableNumber && styles.tableButtonTextSelected,
+                      ]}
+                    >
+                      {tableNumber}
+                    </ThemedText>
+                    {isOccupied && (
+                      <ThemedText style={styles.occupiedIndicator}>●</ThemedText>
+                    )}
+                  </TouchableOpacity>
+                );
+              })}
             </ThemedView>
 
-            {selectedTable && (
-              <ThemedView style={styles.selectedTableContainer}>
-                <ThemedText style={styles.selectedTableText}>
-                  Selected Table: {selectedTable}
-                </ThemedText>
-              </ThemedView>
-            )}
+            
           </ThemedView>
         )}
       </ScrollView>
@@ -220,9 +310,16 @@ const styles = StyleSheet.create({
     paddingVertical: 40,
   },
   emptyText: {
-    fontSize: 16,
-    opacity: 0.7,
+    fontSize: 18,
+    opacity: 0.9,
+    marginBottom: 8,
+    fontWeight: '600',
+  },
+  emptySubtext: {
+    fontSize: 14,
+    opacity: 0.6,
     marginBottom: 20,
+    textAlign: 'center',
   },
   refreshButton: {
     backgroundColor: '#007AFF',
@@ -253,6 +350,12 @@ const styles = StyleSheet.create({
     marginBottom: 12,
     borderWidth: 2,
     borderColor: 'transparent',
+    position: 'relative',
+  },
+  tableButtonOccupied: {
+    backgroundColor: '#FFF3CD',
+    borderColor: '#FFC107',
+    borderWidth: 2,
   },
   tableButtonSelected: {
     backgroundColor: '#007AFF',
@@ -264,8 +367,18 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     color: '#000000',
   },
+  tableButtonTextOccupied: {
+    color: '#856404',
+  },
   tableButtonTextSelected: {
     color: '#FFFFFF',
+  },
+  occupiedIndicator: {
+    position: 'absolute',
+    top: 8,
+    right: 8,
+    fontSize: 12,
+    color: '#FFC107',
   },
   selectedTableContainer: {
     marginTop: 30,

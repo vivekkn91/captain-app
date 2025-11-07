@@ -37,6 +37,7 @@ interface Product {
   };
   status: string;
   Basequantity?: number | string;
+  price?: number;
 }
 
 interface OrderItem {
@@ -63,6 +64,8 @@ export default function OrderScreen() {
   const [billNumber, setBillNumber] = useState<string | null>(null);
   const [billNumberLoading, setBillNumberLoading] = useState<boolean>(false);
   const [sequenceNumber, setSequenceNumber] = useState<number>(0);
+  const [existingBillId, setExistingBillId] = useState<string | null>(null);
+  const [loadingLastOrder, setLoadingLastOrder] = useState<boolean>(false);
 
   useEffect(() => {
     const loadApiUrl = async () => {
@@ -88,6 +91,8 @@ export default function OrderScreen() {
   useEffect(() => {
     const fetchBillNumber = async () => {
       if (!apiUrl) return;
+      // Do not fetch a new bill number if there is an existing active bill
+      if (existingBillId) return;
       try {
         setBillNumberLoading(true);
         const token = await AsyncStorage.getItem('token');
@@ -105,7 +110,7 @@ export default function OrderScreen() {
       }
     };
     fetchBillNumber();
-  }, [apiUrl]);
+  }, [apiUrl, existingBillId]);
 
   useEffect(() => {
     if (selectedCategory && products.length > 0) {
@@ -117,6 +122,93 @@ export default function OrderScreen() {
       setFilteredProducts([]);
     }
   }, [selectedCategory, products]);
+
+  // Fetch last order for the table when tableNumber and apiUrl are available
+  useEffect(() => {
+    const fetchLastOrder = async () => {
+      if (!apiUrl || !tableNumber) return;
+      
+      setLoadingLastOrder(true);
+      try {
+        const token = await AsyncStorage.getItem('token');
+        const response = await axios.post(
+          `${apiUrl}/api/bill/getTableStatus`,
+          { tableNumber },
+          {
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${token}`,
+            },
+          }
+        );
+
+        // Check if table has an active order
+        if (response.data.status === 'success' && response.data.data) {
+          const billData = response.data.data;
+          
+          // Set the existing bill ID and bill number
+          setExistingBillId(billData._id);
+          setBillNumber(billData.billNumber);
+          
+          // Map items from API response to OrderItem format
+          if (billData.items && Array.isArray(billData.items)) {
+            const mappedItems: OrderItem[] = billData.items
+              .filter((item: any) => item.status === 'active' && item.productId) // Only active items
+              .map((item: any) => {
+                const productId = item.productId;
+                
+                // Try to find the product in the products list to get full category info
+                const existingProduct = products.find(p => p._id === productId._id);
+                
+                // If product exists in state, use it; otherwise create from API data
+                const product: Product = existingProduct || {
+                  _id: productId._id,
+                  name: productId.name,
+                  category: {
+                    _id: productId.category,
+                    // Try to find category name from categories list
+                    name: categories.find(c => c._id === productId.category)?.name || '',
+                  },
+                  status: productId.status || 'active',
+                  Basequantity: productId.Basequantity,
+                  price: productId.price,
+                };
+                
+                // Ensure price is set from API if not in product
+                if (!product.price && productId.price) {
+                  product.price = productId.price;
+                }
+                
+                return {
+                  product,
+                  quantity: item.quantity,
+                };
+              });
+            
+            setOrderItems(mappedItems);
+          }
+        } else if (response.data.status === 'table-free') {
+          // Table is free, reset to empty state
+          setExistingBillId(null);
+          setOrderItems([]);
+          // Don't reset billNumber here, keep the new bill number for new orders
+        }
+      } catch (err: any) {
+        console.error('Error fetching last order:', err);
+        // Don't show alert, just log error - table might be free
+        setExistingBillId(null);
+        setOrderItems([]);
+      } finally {
+        setLoadingLastOrder(false);
+      }
+    };
+
+    // Fetch when tableNumber and apiUrl are available
+    // Also depend on products and categories for proper mapping
+    if (apiUrl && tableNumber) {
+      fetchLastOrder();
+    }
+  }, [apiUrl, tableNumber, products, categories]);
 
   const fetchCategories = async () => {
     if (!apiUrl) return;
@@ -309,6 +401,13 @@ export default function OrderScreen() {
       };
 
       const token = await AsyncStorage.getItem('token');
+      
+      // If there's an existing bill, we should update it instead of creating a new one
+      // TODO: Check if your backend has an update endpoint like PUT /api/bill/update/:billId
+      // For now, we're creating a new bill each time
+      // Note: If updating an existing bill, you may want to use:
+      // const response = await axios.put(`${apiUrl}/api/bill/update/${existingBillId}`, billData, {...});
+      
       const response = await axios.post(`${apiUrl}/api/bill/create`, billData, {
         headers: {
           'Content-Type': 'application/json',
@@ -317,9 +416,17 @@ export default function OrderScreen() {
       });
 
       if (response.status === 200 || response.status === 201) {
-        Alert.alert('Success', 'KOT submitted successfully!');
-        await updateBillNumber();
+        Alert.alert('Success', existingBillId ? 'Order updated successfully!' : 'KOT submitted successfully!');
+        
+        // Only update bill number if creating a new bill
+        if (!existingBillId) {
+          await updateBillNumber();
+        }
+        
+        // Reset order items and existing bill ID after successful submission
         setOrderItems([]);
+        setExistingBillId(null);
+        
         router.back();
       }
     } catch (err: any) {
@@ -350,7 +457,21 @@ export default function OrderScreen() {
         </TouchableOpacity>
       </View> */}
 
+      {(loadingLastOrder && orderItems.length === 0) ? (
+        <View style={styles.loadingContainer}>
+          <ActivityIndicator size="large" color="#007AFF" />
+          <ThemedText style={styles.loadingText}>Loading order for Table {tableNumber}...</ThemedText>
+        </View>
+      ) : (
       <ScrollView style={styles.scrollView} contentContainerStyle={styles.scrollContent}>
+        {/* Table Info */}
+        {tableNumber && (
+          <View style={styles.tableInfoContainer}>
+            <ThemedText style={styles.tableInfoText}>
+              Table {tableNumber} {existingBillId ? `(Order: ${billNumber})` : ''}
+            </ThemedText>
+          </View>
+        )}
         {/* Category Dropdown */}
         <View style={styles.categorySection}>
           <ThemedText style={styles.sectionTitle}>Select Category</ThemedText>
@@ -484,25 +605,48 @@ export default function OrderScreen() {
                 Total: ₹{getTotalOrderCost().toFixed(2)}
               </ThemedText>
             </View>
-            <TouchableOpacity
-              disabled={loading || billNumberLoading}
-              onPress={submitKOT}
-              style={[
-                styles.submitButton,
-                (loading || billNumberLoading) ? { opacity: 0.6 } : null,
-              ]}
-            >
-              {loading ? (
-                <ActivityIndicator color="#fff" />
-              ) : (
-                <ThemedText style={styles.submitButtonText}>
-                  {billNumber ? `Submit to KOT (Bill ${billNumber})` : 'Submit to KOT'}
-                </ThemedText>
-              )}
-            </TouchableOpacity>
+            {existingBillId ? (
+              <TouchableOpacity
+                disabled={loading}
+                onPress={() => {
+                  Alert.alert('Update KOT', 'Update KOT action will be implemented.');
+                }}
+                style={[
+                  styles.submitButton,
+                  loading ? { opacity: 0.6 } : null,
+                  { backgroundColor: '#FF9500' },
+                ]}
+              >
+                {loading ? (
+                  <ActivityIndicator color="#fff" />
+                ) : (
+                  <ThemedText style={styles.submitButtonText}>
+                    {`Update KOT ${billNumber ? `(Bill ${billNumber})` : ''}`}
+                  </ThemedText>
+                )}
+              </TouchableOpacity>
+            ) : (
+              <TouchableOpacity
+                disabled={loading || billNumberLoading}
+                onPress={submitKOT}
+                style={[
+                  styles.submitButton,
+                  (loading || billNumberLoading) ? { opacity: 0.6 } : null,
+                ]}
+              >
+                {loading ? (
+                  <ActivityIndicator color="#fff" />
+                ) : (
+                  <ThemedText style={styles.submitButtonText}>
+                    {billNumber ? `Submit to KOT (Bill ${billNumber})` : 'Submit to KOT'}
+                  </ThemedText>
+                )}
+              </TouchableOpacity>
+            )}
           </View>
         )}
       </ScrollView>
+      )}
     </ThemedView>
   );
 }
@@ -550,6 +694,29 @@ const styles = StyleSheet.create({
   },
   scrollContent: {
     padding: 16,
+  },
+  loadingContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingVertical: 40,
+  },
+  loadingText: {
+    marginTop: 16,
+    fontSize: 16,
+    opacity: 0.7,
+  },
+  tableInfoContainer: {
+    backgroundColor: '#E5E5EA',
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 20,
+    alignItems: 'center',
+  },
+  tableInfoText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#000',
   },
   categorySection: {
     marginBottom: 24,
