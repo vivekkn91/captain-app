@@ -22,6 +22,7 @@ export default function HomeScreen() {
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [apiUrl, setApiUrl] = useState<string | null>(null);
+  const [isLoadingIp, setIsLoadingIp] = useState(true);
 
   useEffect(() => {
     const loadApiUrl = async () => {
@@ -32,12 +33,18 @@ export default function HomeScreen() {
         }
       } catch (err) {
         console.error('Failed to load server IP:', err);
+      } finally {
+        setIsLoadingIp(false);
       }
     };
     loadApiUrl();
   }, []);
 
   const fetchAvailableTables = useCallback(async () => {
+    // Wait for IP to finish loading before checking
+    if (isLoadingIp) {
+      return;
+    }
     if (!apiUrl) {
       Alert.alert('Error', 'Server IP not configured. Please login first.');
       return;
@@ -128,24 +135,25 @@ export default function HomeScreen() {
       );
       setAvailableTables([]);
       setOccupiedTables(new Set());
-    } finally {
-      setLoading(false);
-    }
-  }, [apiUrl]);
+      } finally {
+        setLoading(false);
+      }
+    }, [apiUrl, isLoadingIp]);
 
   useEffect(() => {
-    if (apiUrl) {
+    // Only fetch tables after IP loading is complete
+    if (!isLoadingIp && apiUrl) {
       fetchAvailableTables();
     }
-  }, [apiUrl, fetchAvailableTables]);
+  }, [apiUrl, isLoadingIp, fetchAvailableTables]);
 
   // Refresh table availability when screen comes into focus
   useFocusEffect(
     useCallback(() => {
-      if (apiUrl) {
+      if (!isLoadingIp && apiUrl) {
         fetchAvailableTables();
       }
-    }, [apiUrl, fetchAvailableTables])
+    }, [apiUrl, isLoadingIp, fetchAvailableTables])
   );
 
   const handleTableSelect = (tableNumber: number) => {

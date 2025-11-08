@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import {
   StyleSheet,
   TouchableOpacity,
@@ -13,7 +13,7 @@ import {
 import axios from 'axios';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useRouter, useLocalSearchParams } from 'expo-router';
-import { useNavigation, DrawerActions } from '@react-navigation/native';
+import { useNavigation, DrawerActions, useFocusEffect } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { ThemedText } from '@/components/themed-text';
@@ -66,6 +66,7 @@ export default function OrderScreen() {
   const [sequenceNumber, setSequenceNumber] = useState<number>(0);
   const [existingBillId, setExistingBillId] = useState<string | null>(null);
   const [loadingLastOrder, setLoadingLastOrder] = useState<boolean>(false);
+  const [isLoadingIp, setIsLoadingIp] = useState(true);
 
   useEffect(() => {
     const loadApiUrl = async () => {
@@ -76,6 +77,8 @@ export default function OrderScreen() {
         }
       } catch (err) {
         console.error('Failed to load server IP:', err);
+      } finally {
+        setIsLoadingIp(false);
       }
     };
     loadApiUrl();
@@ -88,29 +91,7 @@ export default function OrderScreen() {
     }
   }, [apiUrl]);
 
-  useEffect(() => {
-    const fetchBillNumber = async () => {
-      if (!apiUrl) return;
-      // Do not fetch a new bill number if there is an existing active bill
-      if (existingBillId) return;
-      try {
-        setBillNumberLoading(true);
-        const token = await AsyncStorage.getItem('token');
-        const response = await axios.get(`${apiUrl}/api/billnumber/getBillNumber`, {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        });
-        setBillNumber(response.data.currentBillNumber);
-        setSequenceNumber(response.data.number);
-      } catch (err) {
-        console.error('Error fetching bill number:', err);
-      } finally {
-        setBillNumberLoading(false);
-      }
-    };
-    fetchBillNumber();
-  }, [apiUrl, existingBillId]);
+  // Removed automatic bill number fetching - will fetch only when Submit to KOT is clicked
 
   useEffect(() => {
     if (selectedCategory && products.length > 0) {
@@ -124,91 +105,110 @@ export default function OrderScreen() {
   }, [selectedCategory, products]);
 
   // Fetch last order for the table when tableNumber and apiUrl are available
-  useEffect(() => {
-    const fetchLastOrder = async () => {
-      if (!apiUrl || !tableNumber) return;
-      
-      setLoadingLastOrder(true);
-      try {
-        const token = await AsyncStorage.getItem('token');
-        const response = await axios.post(
-          `${apiUrl}/api/bill/getTableStatus`,
-          { tableNumber },
-          {
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${token}`,
-            },
-          }
-        );
+  const fetchLastOrder = useCallback(async () => {
+    if (!apiUrl || !tableNumber || isLoadingIp) return;
+    
+    setLoadingLastOrder(true);
+    try {
+      const token = await AsyncStorage.getItem('token');
+      const response = await axios.post(
+        `${apiUrl}/api/bill/getTableStatus`,
+        { tableNumber },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+        }
+      );
 
-        // Check if table has an active order
-        if (response.data.status === 'success' && response.data.data) {
-          const billData = response.data.data;
-          
-          // Set the existing bill ID and bill number
-          setExistingBillId(billData._id);
-          setBillNumber(billData.billNumber);
-          
-          // Map items from API response to OrderItem format
-          if (billData.items && Array.isArray(billData.items)) {
-            const mappedItems: OrderItem[] = billData.items
-              .filter((item: any) => item.status === 'active' && item.productId) // Only active items
-              .map((item: any) => {
-                const productId = item.productId;
-                
-                // Try to find the product in the products list to get full category info
-                const existingProduct = products.find(p => p._id === productId._id);
-                
-                // If product exists in state, use it; otherwise create from API data
-                const product: Product = existingProduct || {
-                  _id: productId._id,
-                  name: productId.name,
-                  category: {
-                    _id: productId.category,
-                    // Try to find category name from categories list
-                    name: categories.find(c => c._id === productId.category)?.name || '',
-                  },
-                  status: productId.status || 'active',
-                  Basequantity: productId.Basequantity,
-                  price: productId.price,
-                };
-                
-                // Ensure price is set from API if not in product
-                if (!product.price && productId.price) {
-                  product.price = productId.price;
-                }
-                
-                return {
-                  product,
-                  quantity: item.quantity,
-                };
-              });
-            
-            setOrderItems(mappedItems);
-          }
-        } else if (response.data.status === 'table-free') {
-          // Table is free, reset to empty state
+      // Check if table has an active order
+      if (response.data.status === 'success' && response.data.data) {
+        const billData = response.data.data;
+        
+        // Only show orders with active statuses (pending, preparing, ready)
+        // Don't show cancelled or completed orders
+        const activeStatuses = ['pending', 'preparing', 'ready'];
+        if (!activeStatuses.includes(billData.status)) {
+          // Order is completed, cancelled, or bill-printed - treat as table-free
           setExistingBillId(null);
           setOrderItems([]);
-          // Don't reset billNumber here, keep the new bill number for new orders
+          return;
         }
-      } catch (err: any) {
-        console.error('Error fetching last order:', err);
-        // Don't show alert, just log error - table might be free
+        
+        // Set the existing bill ID and bill number
+        setExistingBillId(billData._id);
+        setBillNumber(billData.billNumber);
+        
+        // Map items from API response to OrderItem format
+        if (billData.items && Array.isArray(billData.items)) {
+          const mappedItems: OrderItem[] = billData.items
+            .filter((item: any) => item.status === 'active' && item.productId) // Only active items
+            .map((item: any) => {
+              const productId = item.productId;
+              
+              // Try to find the product in the products list to get full category info
+              const existingProduct = products.find(p => p._id === productId._id);
+              
+              // If product exists in state, use it; otherwise create from API data
+              const product: Product = existingProduct || {
+                _id: productId._id,
+                name: productId.name,
+                category: {
+                  _id: productId.category,
+                  // Try to find category name from categories list
+                  name: categories.find(c => c._id === productId.category)?.name || '',
+                },
+                status: productId.status || 'active',
+                Basequantity: productId.Basequantity,
+                price: productId.price,
+              };
+              
+              // Ensure price is set from API if not in product
+              if (!product.price && productId.price) {
+                product.price = productId.price;
+              }
+              
+              return {
+                product,
+                quantity: item.quantity,
+              };
+            });
+          
+          setOrderItems(mappedItems);
+        }
+      } else if (response.data.status === 'table-free') {
+        // Table is free, reset to empty state
         setExistingBillId(null);
         setOrderItems([]);
-      } finally {
-        setLoadingLastOrder(false);
+        // Don't reset billNumber here, keep the new bill number for new orders
       }
-    };
+    } catch (err: any) {
+      console.error('Error fetching last order:', err);
+      // Don't show alert, just log error - table might be free
+      setExistingBillId(null);
+      setOrderItems([]);
+    } finally {
+      setLoadingLastOrder(false);
+    }
+  }, [apiUrl, tableNumber, products, categories, isLoadingIp]);
 
+  useEffect(() => {
     // Fetch when tableNumber and apiUrl are available
     // Also depend on products and categories for proper mapping
-    if (apiUrl && tableNumber) {
+    if (apiUrl && tableNumber && !isLoadingIp) {
       fetchLastOrder();
     }
-  }, [apiUrl, tableNumber, products, categories]);
+  }, [apiUrl, tableNumber, products, categories, isLoadingIp, fetchLastOrder]);
+
+  // Refresh order when screen comes into focus
+  useFocusEffect(
+    useCallback(() => {
+      if (apiUrl && tableNumber && !isLoadingIp) {
+        fetchLastOrder();
+      }
+    }, [apiUrl, tableNumber, isLoadingIp, fetchLastOrder])
+  );
 
   const fetchCategories = async () => {
     if (!apiUrl) return;
@@ -317,13 +317,16 @@ export default function OrderScreen() {
     }, 0);
   };
 
-  const updateBillNumber = async () => {
+  const updateBillNumber = async (currentSequenceNumber?: number) => {
     if (!apiUrl) return false;
     try {
       const token = await AsyncStorage.getItem('token');
+      // Use provided sequence number or fall back to state
+      const seqToUse = currentSequenceNumber !== undefined ? currentSequenceNumber : sequenceNumber;
+      console.log('Updating bill number sequence from:', seqToUse, 'to:', seqToUse + 1);
       const response = await axios.put(
         `${apiUrl}/api/billnumber/updateBillNumber`,
-        { number: sequenceNumber + 1 },
+        { number: seqToUse + 1 },
         {
           headers: {
             'Content-Type': 'application/json',
@@ -332,7 +335,7 @@ export default function OrderScreen() {
         }
       );
       if (response.status === 200 || response.status === 201) {
-        setOrderItems([]);
+        console.log('Bill number sequence updated successfully');
         // Immediately refetch to get the new bill number string and sequence from server
         try {
           const refreshed = await axios.get(`${apiUrl}/api/billnumber/getBillNumber`, {
@@ -340,20 +343,255 @@ export default function OrderScreen() {
           });
           setBillNumber(refreshed.data.currentBillNumber);
           setSequenceNumber(refreshed.data.number);
+          console.log('Refreshed bill number after update:', refreshed.data.currentBillNumber);
         } catch (err) {
           // Fallback: bump local sequence if refetch fails
-          setSequenceNumber(sequenceNumber + 1);
+          setSequenceNumber(seqToUse + 1);
         }
         return true;
       }
       return false;
     } catch (err) {
       console.error('Error updating bill number:', err);
+      if ((err as any).response) {
+        console.error('Error response data:', (err as any).response.data);
+      }
       return false;
     }
   };
 
+  const fetchBillNumber = async () => {
+    if (!apiUrl) return null;
+    try {
+      setBillNumberLoading(true);
+      const token = await AsyncStorage.getItem('token');
+      console.log('Fetching bill number from:', `${apiUrl}/api/billnumber/getBillNumber`);
+      const response = await axios.get(`${apiUrl}/api/billnumber/getBillNumber`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      console.log('Bill number API response:', JSON.stringify(response.data, null, 2));
+      const billNumber = response.data.currentBillNumber;
+      const seqNumber = response.data.number;
+      console.log('Fetched bill number:', billNumber, 'Sequence:', seqNumber);
+      setBillNumber(billNumber);
+      setSequenceNumber(seqNumber);
+      // Return both bill number and sequence number
+      return { billNumber, sequenceNumber: seqNumber };
+    } catch (err) {
+      console.error('Error fetching bill number:', err);
+      if ((err as any).response) {
+        console.error('Error response data:', (err as any).response.data);
+      }
+      return null;
+    } finally {
+      setBillNumberLoading(false);
+    }
+  };
+
+  const handleClearOrder = () => {
+    Alert.alert(
+      'Clear Order',
+      'Are you sure you want to clear all items from the order?',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Clear',
+          style: 'destructive',
+          onPress: () => {
+            setOrderItems([]);
+            // Reset bill number if it was fetched
+            if (!existingBillId) {
+              setBillNumber(null);
+              setSequenceNumber(0);
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  const handleCancelOrder = async () => {
+    if (isLoadingIp) {
+      return;
+    }
+    if (!apiUrl) {
+      Alert.alert('Error', 'Server IP not configured. Please login first.');
+      return;
+    }
+    if (!existingBillId) {
+      // If no existing bill, just clear the order
+      handleClearOrder();
+      return;
+    }
+
+    Alert.alert(
+      'Cancel Order',
+      'Are you sure you want to cancel this order? The order status will be changed to cancelled.',
+      [
+        { text: 'No', style: 'cancel' },
+        {
+          text: 'Yes, Cancel',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              setLoading(true);
+              const token = await AsyncStorage.getItem('token');
+              
+              // Update bill status to cancelled using updateStatus endpoint
+              const response = await axios.put(
+                `${apiUrl}/api/bill/updateStatus`,
+                {
+                  _id: existingBillId,
+                  status: 'cancelled'
+                },
+                {
+                  headers: {
+                    Authorization: `Bearer ${token}`,
+                  },
+                }
+              );
+
+              if (response.status === 200 || response.status === 201) {
+                Alert.alert('Success', 'Order cancelled successfully!');
+                // Clear order list
+                setOrderItems([]);
+                setBillNumber(null);
+                setSequenceNumber(0);
+                setExistingBillId(null);
+              }
+            } catch (err: any) {
+              console.error('Error cancelling order:', err);
+              Alert.alert('Failed to cancel order', err.response?.data?.message || err.message || 'Unknown error');
+            } finally {
+              setLoading(false);
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  const handleCompleteOrder = async () => {
+    // Wait for IP to finish loading before checking
+    if (isLoadingIp) {
+      return;
+    }
+    if (!apiUrl) {
+      Alert.alert('Error', 'Server IP not configured. Please login first.');
+      return;
+    }
+    if (!tableNumber) {
+      Alert.alert('Select Table', 'Please select a table before completing order.');
+      return;
+    }
+    if (orderItems.length === 0) {
+      Alert.alert('Empty Order', 'Add items to the order before completing.');
+      return;
+    }
+
+    try {
+      setLoading(true);
+      const token = await AsyncStorage.getItem('token');
+      let response;
+
+      // If there's an existing bill, update its status instead of creating a new one
+      if (existingBillId) {
+        console.log('Complete Order: Updating existing bill status to completed');
+        response = await axios.put(
+          `${apiUrl}/api/bill/updateStatus`,
+          {
+            _id: existingBillId,
+            status: 'completed'
+          },
+          {
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          }
+        );
+      } else {
+        // New order - fetch bill number and create it
+        console.log('Complete Order: Fetching bill number for new order...');
+        const fetchedBillData = await fetchBillNumber();
+        if (!fetchedBillData || !fetchedBillData.billNumber) {
+          Alert.alert('Error', 'Failed to fetch bill number. Please try again.');
+          setLoading(false);
+          return;
+        }
+        const fetchedBillNumber = fetchedBillData.billNumber;
+        const fetchedSequenceNumber = fetchedBillData.sequenceNumber;
+        console.log('Complete Order: Fetched bill number:', fetchedBillNumber);
+        console.log('Complete Order: Fetched sequence number:', fetchedSequenceNumber);
+
+        const sanitizedItems = orderItems.map((item) => {
+          const price = (item.product as any)?.price ? Number((item.product as any).price) : 0;
+          return {
+            productId: item.product._id,
+            name: item.product.name,
+            quantity: item.quantity,
+            price: price,
+            subtotal: price * item.quantity,
+            Basequantity: 1,
+          };
+        });
+
+        const totalAmount = getTotalOrderCost();
+        const billData = {
+          billNumber: fetchedBillNumber,
+          paymentMethod: 'cash',
+          status: 'completed', // Directly set as completed
+          orderType: 'dine-in',
+          tableNumber: tableNumber,
+          table: tableNumber,
+          items: sanitizedItems,
+          totalAmount: totalAmount,
+          cgst: 0,
+          sgst: 0,
+          payableAmount: totalAmount,
+          date: new Date().toISOString(),
+        };
+
+        console.log('Complete Order: Creating new bill with status completed:', JSON.stringify(billData, null, 2));
+        console.log('Complete Order: Bill number being submitted:', fetchedBillNumber);
+
+        response = await axios.post(`${apiUrl}/api/bill/create`, billData, {
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+        });
+
+        // Only update bill number sequence for new orders
+        if (response.status === 200 || response.status === 201) {
+          console.log('Complete Order: Updating bill number sequence...');
+          await updateBillNumber(fetchedSequenceNumber);
+        }
+      }
+
+      if (response.status === 200 || response.status === 201) {
+        Alert.alert('Success', 'Order completed successfully!');
+        
+        // Clear order list so new order can be made
+        setOrderItems([]);
+        setBillNumber(null);
+        setSequenceNumber(0);
+        setExistingBillId(null);
+      }
+    } catch (err: any) {
+      console.error('Error completing order:', err);
+      Alert.alert('Failed to complete order', err.response?.data?.message || err.message || 'Unknown error');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const submitKOT = async () => {
+    // Wait for IP to finish loading before checking
+    if (isLoadingIp) {
+      return;
+    }
     if (!apiUrl) {
       Alert.alert('Error', 'Server IP not configured. Please login first.');
       return;
@@ -362,16 +600,24 @@ export default function OrderScreen() {
       Alert.alert('Select Table', 'Please select a table before submitting KOT.');
       return;
     }
-    if (!billNumber) {
-      Alert.alert('Bill Number Pending', 'Fetching bill number. Please try again in a moment.');
-      return;
-    }
     if (orderItems.length === 0) {
       Alert.alert('Empty Order', 'Add items to the order before submitting.');
       return;
     }
     try {
       setLoading(true);
+      // Fetch bill number only when submitting to KOT
+      console.log('Submit KOT: Fetching bill number...');
+      const fetchedBillData = await fetchBillNumber();
+      if (!fetchedBillData || !fetchedBillData.billNumber) {
+        Alert.alert('Error', 'Failed to fetch bill number. Please try again.');
+        setLoading(false);
+        return;
+      }
+      const fetchedBillNumber = fetchedBillData.billNumber;
+      const fetchedSequenceNumber = fetchedBillData.sequenceNumber;
+      console.log('Submit KOT: Fetched bill number:', fetchedBillNumber);
+      console.log('Submit KOT: Fetched sequence number:', fetchedSequenceNumber);
       const sanitizedItems = orderItems.map((item) => {
         const price = (item.product as any)?.price ? Number((item.product as any).price) : 0;
         return {
@@ -386,7 +632,7 @@ export default function OrderScreen() {
 
       const totalAmount = getTotalOrderCost();
       const billData = {
-        billNumber,
+        billNumber: fetchedBillNumber,
         paymentMethod: 'cash',
         status: 'pending',
         orderType: 'dine-in',
@@ -401,13 +647,16 @@ export default function OrderScreen() {
       };
 
       const token = await AsyncStorage.getItem('token');
+
+      // If there's an existing bill, we should not create a new one
+      // The Update KOT button should handle updating existing bills
+      if (existingBillId) {
+        Alert.alert('Error', 'An order already exists for this table. Please use "Update KOT" to modify it.');
+        setLoading(false);
+        return;
+      }
       
-      // If there's an existing bill, we should update it instead of creating a new one
-      // TODO: Check if your backend has an update endpoint like PUT /api/bill/update/:billId
-      // For now, we're creating a new bill each time
-      // Note: If updating an existing bill, you may want to use:
-      // const response = await axios.put(`${apiUrl}/api/bill/update/${existingBillId}`, billData, {...});
-      
+      // New order - create it
       const response = await axios.post(`${apiUrl}/api/bill/create`, billData, {
         headers: {
           'Content-Type': 'application/json',
@@ -416,18 +665,14 @@ export default function OrderScreen() {
       });
 
       if (response.status === 200 || response.status === 201) {
-        Alert.alert('Success', existingBillId ? 'Order updated successfully!' : 'KOT submitted successfully!');
+        Alert.alert('Success', 'KOT submitted successfully!');
         
-        // Only update bill number if creating a new bill
-        if (!existingBillId) {
-          await updateBillNumber();
-        }
+        // Update bill number sequence using the sequence number we just fetched
+        console.log('Submit KOT: Updating bill number sequence...');
+        await updateBillNumber(fetchedSequenceNumber);
         
-        // Reset order items and existing bill ID after successful submission
-        setOrderItems([]);
-        setExistingBillId(null);
-        
-        router.back();
+        // Refetch the order to show the submitted order
+        await fetchLastOrder();
       }
     } catch (err: any) {
       console.error('Error creating bill:', err);
@@ -605,6 +850,56 @@ export default function OrderScreen() {
                 Total: ₹{getTotalOrderCost().toFixed(2)}
               </ThemedText>
             </View>
+            
+            {/* Action Buttons */}
+            <View style={styles.actionButtonsContainer}>
+              {/* Clear Order / Cancel Order Button */}
+              {existingBillId ? (
+                <TouchableOpacity
+                  disabled={loading || orderItems.length === 0}
+                  onPress={handleCancelOrder}
+                  style={[
+                    styles.clearButton,
+                    (loading || orderItems.length === 0) ? { opacity: 0.6 } : null,
+                  ]}
+                >
+                  {loading ? (
+                    <ActivityIndicator color="#fff" />
+                  ) : (
+                    <ThemedText style={styles.clearButtonText}>Cancel Order</ThemedText>
+                  )}
+                </TouchableOpacity>
+              ) : (
+                <TouchableOpacity
+                  disabled={loading || orderItems.length === 0}
+                  onPress={handleClearOrder}
+                  style={[
+                    styles.clearButton,
+                    (loading || orderItems.length === 0) ? { opacity: 0.6 } : null,
+                  ]}
+                >
+                  <ThemedText style={styles.clearButtonText}>Clear Order</ThemedText>
+                </TouchableOpacity>
+              )}
+
+              {/* Complete Order Button */}
+              <TouchableOpacity
+                disabled={loading || billNumberLoading || orderItems.length === 0}
+                onPress={handleCompleteOrder}
+                style={[
+                  styles.completeButton,
+                  (loading || billNumberLoading || orderItems.length === 0) ? { opacity: 0.6 } : null,
+                ]}
+              >
+                {loading ? (
+                  <ActivityIndicator color="#fff" />
+                ) : (
+                  <ThemedText style={styles.completeButtonText}>Complete Order</ThemedText>
+                )}
+              </TouchableOpacity>
+            </View>
+
+            {/* Submit to KOT Button */}
             {existingBillId ? (
               <TouchableOpacity
                 disabled={loading}
@@ -627,18 +922,18 @@ export default function OrderScreen() {
               </TouchableOpacity>
             ) : (
               <TouchableOpacity
-                disabled={loading || billNumberLoading}
+                disabled={loading || billNumberLoading || orderItems.length === 0}
                 onPress={submitKOT}
                 style={[
                   styles.submitButton,
-                  (loading || billNumberLoading) ? { opacity: 0.6 } : null,
+                  (loading || billNumberLoading || orderItems.length === 0) ? { opacity: 0.6 } : null,
                 ]}
               >
-                {loading ? (
+                {loading || billNumberLoading ? (
                   <ActivityIndicator color="#fff" />
                 ) : (
                   <ThemedText style={styles.submitButtonText}>
-                    {billNumber ? `Submit to KOT (Bill ${billNumber})` : 'Submit to KOT'}
+                    Submit to KOT
                   </ThemedText>
                 )}
               </TouchableOpacity>
@@ -903,6 +1198,36 @@ const styles = StyleSheet.create({
   totalCostLabel: {
     fontSize: 20,
     color: '#FFFFFF',
+  },
+  actionButtonsContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 12,
+    gap: 12,
+  },
+  clearButton: {
+    flex: 1,
+    backgroundColor: '#FF3B30',
+    borderRadius: 12,
+    padding: 16,
+    alignItems: 'center',
+  },
+  clearButtonText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  completeButton: {
+    flex: 1,
+    backgroundColor: '#5856D6',
+    borderRadius: 12,
+    padding: 16,
+    alignItems: 'center',
+  },
+  completeButtonText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '600',
   },
   submitButton: {
     marginTop: 12,
