@@ -40,9 +40,15 @@ interface Product {
   price?: number;
 }
 
+type ItemStatus = 'original' | 'addon' | 'removed';
+
 interface OrderItem {
   product: Product;
   quantity: number;
+  itemStatus?: ItemStatus; // 'original' = submitted to kitchen, 'addon' = added later, 'removed' = removed from order
+  originalQuantity?: number; // Track original quantity before removal
+  localId?: string; // local client id to uniquely identify list entries
+  serverItemIds?: string[]; // IDs of server-side bill items that this client item aggregates
 }
 
 export default function OrderScreen() {
@@ -67,6 +73,7 @@ export default function OrderScreen() {
   const [existingBillId, setExistingBillId] = useState<string | null>(null);
   const [loadingLastOrder, setLoadingLastOrder] = useState<boolean>(false);
   const [isLoadingIp, setIsLoadingIp] = useState(true);
+  const [originalSubmittedItems, setOriginalSubmittedItems] = useState<OrderItem[]>([]); // Track items that were originally submitted to KOT
 
   useEffect(() => {
     const loadApiUrl = async () => {
@@ -142,45 +149,160 @@ export default function OrderScreen() {
         
         // Map items from API response to OrderItem format
         if (billData.items && Array.isArray(billData.items)) {
-          const mappedItems: OrderItem[] = billData.items
-            .filter((item: any) => item.status === 'active' && item.productId) // Only active items
-            .map((item: any) => {
-              const productId = item.productId;
-              
-              // Try to find the product in the products list to get full category info
-              const existingProduct = products.find(p => p._id === productId._id);
-              
-              // If product exists in state, use it; otherwise create from API data
-              const product: Product = existingProduct || {
-                _id: productId._id,
-                name: productId.name,
-                category: {
-                  _id: productId.category,
-                  // Try to find category name from categories list
-                  name: categories.find(c => c._id === productId.category)?.name || '',
-                },
-                status: productId.status || 'active',
-                Basequantity: productId.Basequantity,
-                price: productId.price,
-              };
-              
-              // Ensure price is set from API if not in product
-              if (!product.price && productId.price) {
-                product.price = productId.price;
-              }
-              
-              return {
-                product,
-                quantity: item.quantity,
-              };
-            });
+          // Process all items - don't filter by status yet
+          const allItems = billData.items.filter((item: any) => item.productId);
           
-          setOrderItems(mappedItems);
+          // Map to track items by product ID to handle potential duplicates from server
+          // Only merge if we have multiple active items with same product ID (addon scenario)
+          const itemsByProductId = new Map<string, OrderItem[]>();
+          
+          allItems.forEach((item: any) => {
+            const productId = item.productId;
+            // Handle different productId formats: string, object with _id, or nested object
+            let productIdString: string = '';
+            let productName: string = '';
+            let productCategoryId: string = '';
+            let productStatus: string = 'active';
+            let productBasequantity: number | string | undefined;
+            let productPrice: number | undefined;
+            
+            if (typeof productId === 'string') {
+              productIdString = productId;
+            } else if (productId && typeof productId === 'object') {
+              productIdString = productId._id || String(productId);
+              productName = productId.name || '';
+              productCategoryId = productId.category || '';
+              productStatus = productId.status || 'active';
+              productBasequantity = productId.Basequantity;
+              productPrice = productId.price;
+            } else {
+              console.warn('Skipping item with invalid productId:', item);
+              return;
+            }
+            
+            if (!productIdString) {
+              console.warn('Skipping item with invalid productId:', item);
+              return;
+            }
+            
+            // Try to find the product in the products list to get full category info
+            const existingProduct = products.find(p => p._id === productIdString);
+            
+            // Extract product info, preferring existing product data
+            const finalProductName = productName || existingProduct?.name || 'Unknown Product';
+            const finalProductCategoryId = productCategoryId || existingProduct?.category?._id || '';
+            const finalProductStatus = productStatus || existingProduct?.status || 'active';
+            const finalProductBasequantity = productBasequantity || existingProduct?.Basequantity;
+            const finalProductPrice = item.price || productPrice || existingProduct?.price;
+            
+            // If product exists in state, use it; otherwise create from API data
+            const product: Product = existingProduct || {
+              _id: productIdString,
+              name: finalProductName,
+              category: {
+                _id: finalProductCategoryId,
+                // Try to find category name from categories list
+                name: categories.find(c => c._id === finalProductCategoryId)?.name || '',
+              },
+              status: finalProductStatus,
+              Basequantity: finalProductBasequantity,
+              price: finalProductPrice,
+            };
+            
+            // Ensure price is set from API if not in product
+            if (!product.price && item.price) {
+              product.price = item.price;
+            }
+            
+            const isCanceled = item.status === 'canceled';
+            const orderItem: OrderItem = {
+              product,
+              quantity: item.quantity || 0,
+              itemStatus: isCanceled ? 'removed' as ItemStatus : 'original' as ItemStatus,
+            };
+            
+            // For canceled items, try to get original quantity from item updates
+            if (isCanceled) {
+              if (item.updates && item.updates.length > 0) {
+                // Find the canceled update - it should have the quantity that was canceled
+                const canceledUpdate = item.updates.find((update: any) => update.changeType === 'canceled');
+                if (canceledUpdate && canceledUpdate.quantity) {
+                  // The quantity in the canceled update is the original quantity before cancellation
+                  orderItem.originalQuantity = canceledUpdate.quantity;
+                } else {
+                  // If no canceled update found, try to sum all update quantities as fallback
+                  // This is not ideal but better than 0
+                  const totalFromUpdates = item.updates.reduce((sum: number, update: any) => {
+                    return sum + (update.quantity || 0);
+                  }, 0);
+                  orderItem.originalQuantity = totalFromUpdates || 1; // Default to 1 if we can't determine
+                }
+              } else {
+                // No updates available - this shouldn't happen for canceled items
+                // But if it does, default to 1
+                orderItem.originalQuantity = 1;
+              }
+            }
+            
+            // Group items by product ID
+            if (!itemsByProductId.has(productIdString)) {
+              itemsByProductId.set(productIdString, []);
+            }
+            itemsByProductId.get(productIdString)!.push(orderItem);
+          });
+          
+          // Aggregate server-side items per product into a single original entry
+          // This prevents duplicate lines for the same product while preserving
+          // the list of server-side item ids so we can perform deterministic
+          // updates later.
+          const mappedItems: OrderItem[] = [];
+
+          itemsByProductId.forEach((items, productId) => {
+            // Separate canceled and active items
+            const canceledItemsForProduct = items.filter(item => item.itemStatus === 'removed');
+            const activeItemsForProduct = items.filter(item => item.itemStatus !== 'removed' && item.quantity > 0);
+
+            // If there are canceled items, create a removed entry (keep originalQuantity)
+            if (canceledItemsForProduct.length > 0) {
+              const canceledTotal = canceledItemsForProduct.reduce((sum, it) => sum + (it.originalQuantity || it.quantity || 0), 0);
+              const prototype = canceledItemsForProduct[0];
+              mappedItems.push({
+                product: prototype.product,
+                quantity: 0,
+                itemStatus: 'removed',
+                originalQuantity: canceledTotal,
+                localId: prototype.localId ?? `srv-removed-${productId}-${Date.now()}`,
+                serverItemIds: canceledItemsForProduct.map((it: any) => (it as any)._id || (it as any).serverItemId).filter(Boolean),
+              });
+            }
+
+            if (activeItemsForProduct.length > 0) {
+              // Aggregate active quantities into one entry
+              const totalQty = activeItemsForProduct.reduce((sum, it) => sum + (it.quantity || 0), 0);
+              const prototype = activeItemsForProduct[0];
+              mappedItems.push({
+                product: prototype.product,
+                quantity: totalQty,
+                itemStatus: 'original',
+                localId: prototype.localId ?? `srv-${productId}-${Date.now()}`,
+                serverItemIds: activeItemsForProduct.map((it: any) => (it as any)._id || (it as any).serverItemId).filter(Boolean),
+              });
+            }
+          });
+
+          // Ensure every item has a stable localId for client-side operations
+          const mappedWithIds = mappedItems.map((m, idx) => ({
+            ...m,
+            localId: m.localId ?? `srv-${m.product._id}-${Date.now()}-${idx}`,
+          }));
+          setOrderItems(mappedWithIds);
+          setOriginalSubmittedItems(mappedWithIds.filter(item => item.itemStatus === 'original' || !item.itemStatus)); // Store original items for comparison
         }
       } else if (response.data.status === 'table-free') {
         // Table is free, reset to empty state
         setExistingBillId(null);
         setOrderItems([]);
+        setOriginalSubmittedItems([]);
         // Don't reset billNumber here, keep the new bill number for new orders
       }
     } catch (err: any) {
@@ -188,6 +310,7 @@ export default function OrderScreen() {
       // Don't show alert, just log error - table might be free
       setExistingBillId(null);
       setOrderItems([]);
+      setOriginalSubmittedItems([]);
     } finally {
       setLoadingLastOrder(false);
     }
@@ -267,42 +390,132 @@ export default function OrderScreen() {
   };
 
   const handleAddToOrder = (product: Product) => {
-    const existingItem = orderItems.find((item) => item.product._id === product._id);
+    // Prefer matching an existing non-removed entry with same product and same status
+    const existingItem = orderItems.find((item) => item.product._id === product._id && item.itemStatus !== 'removed');
+    
     if (existingItem) {
-      setOrderItems(
-        orderItems.map((item) =>
-          item.product._id === product._id
-            ? { ...item, quantity: item.quantity + 1 }
-            : item
-        )
-      );
+      // If item exists and is not removed
+      if (existingItem.itemStatus === 'removed') {
+        // Restore removed item as addon
+        setOrderItems(
+          orderItems.map((item) => {
+            if (item.product._id === product._id) {
+              return { 
+                ...item, 
+                quantity: 1, 
+                itemStatus: 'addon' as ItemStatus,
+                originalQuantity: undefined 
+              };
+            }
+            return item;
+          })
+        );
+      } else if (existingBillId && existingItem.itemStatus === 'original') {
+        // If order is already submitted to KOT and this is an original item,
+        // create a separate addon entry instead of incrementing the original
+        const addonItem = orderItems.find(
+          (item) => item.product._id === product._id && item.itemStatus === 'addon'
+        );
+        
+        if (addonItem) {
+          // If addon entry already exists, increment it
+          setOrderItems(
+            orderItems.map((item) =>
+              item.product._id === product._id && item.itemStatus === 'addon'
+                ? { ...item, quantity: item.quantity + 1 }
+                : item
+            )
+          );
+        } else {
+          // Create new addon entry
+          setOrderItems([...orderItems, { product, quantity: 1, itemStatus: 'addon' as ItemStatus }]);
+        }
+      } else {
+        // For new orders (not submitted) or addon items, just increment quantity
+        setOrderItems(
+          orderItems.map((item) =>
+            item.product._id === product._id ? { ...item, quantity: item.quantity + 1 } : item
+          )
+        );
+      }
     } else {
-      setOrderItems([...orderItems, { product, quantity: 1 }]);
+      // New item - check if order already exists (submitted to KOT)
+      const itemStatus: ItemStatus | undefined = existingBillId ? 'addon' : undefined;
+      const newItem: OrderItem = { product, quantity: 1, itemStatus, localId: `local-${Date.now()}-${Math.random().toString(36).slice(2,8)}` };
+      setOrderItems([...orderItems, newItem]);
     }
   };
 
-  const handleIncrementQuantity = (productId: string) => {
-    setOrderItems(
-      orderItems.map((item) =>
-        item.product._id === productId ? { ...item, quantity: item.quantity + 1 } : item
-      )
-    );
+  // Operate on items by their localId to avoid ambiguous matches when product appears multiple times
+  const handleIncrementQuantity = (localId: string) => {
+    console.log('handleIncrementQuantity called for', localId);
+    const idx = orderItems.findIndex(i => i.localId === localId);
+    if (idx === -1) {
+      console.warn('handleIncrementQuantity: localId not found', localId);
+      return;
+    }
+    const target = orderItems[idx];
+
+    // If order already submitted and this is an original item, increment/add an addon instead
+    const isOriginal = !target.itemStatus || target.itemStatus === 'original';
+    if (existingBillId && isOriginal) {
+      // find existing addon for same product
+      const addonIdx = orderItems.findIndex(i => i.product._id === target.product._id && i.itemStatus === 'addon');
+      if (addonIdx !== -1) {
+        const newItems = [...orderItems];
+        newItems[addonIdx] = { ...newItems[addonIdx], quantity: newItems[addonIdx].quantity + 1 };
+        setOrderItems(newItems);
+      } else {
+        const addonItem: OrderItem = {
+          product: target.product,
+          quantity: 1,
+          itemStatus: 'addon',
+          localId: `local-${Date.now()}-${Math.random().toString(36).slice(2,8)}`
+        };
+        setOrderItems([...orderItems, addonItem]);
+      }
+      return;
+    }
+
+    // Otherwise increment the target item
+    const newItems = [...orderItems];
+    newItems[idx] = { ...target, quantity: target.quantity + 1 };
+    setOrderItems(newItems);
   };
 
-  const handleDecrementQuantity = (productId: string) => {
-    setOrderItems(
-      orderItems
-        .map((item) =>
-          item.product._id === productId
-            ? { ...item, quantity: Math.max(0, item.quantity - 1) }
-            : item
-        )
-        .filter((item) => item.quantity > 0)
-    );
+  const handleDecrementQuantity = (localId: string) => {
+    console.log('handleDecrementQuantity called for', localId);
+    const idx = orderItems.findIndex(i => i.localId === localId);
+    if (idx === -1) {
+      console.warn('handleDecrementQuantity: localId not found', localId);
+      return;
+    }
+    const target = orderItems[idx];
+
+    const newItems = [...orderItems];
+    const newQuantity = target.quantity - 1;
+
+    if (newQuantity <= 0) {
+      const isOriginal = !target.itemStatus || target.itemStatus === 'original';
+      if (isOriginal && existingBillId) {
+        // mark as removed but keep in list
+        newItems[idx] = { ...target, quantity: 0, itemStatus: 'removed', originalQuantity: target.quantity };
+      } else {
+        // remove the item entirely (addon or new order)
+        newItems.splice(idx, 1);
+      }
+    } else {
+      newItems[idx] = { ...target, quantity: newQuantity };
+    }
+
+    setOrderItems(newItems);
   };
 
   const getTotalItems = () => {
-    return orderItems.reduce((total, item) => total + item.quantity, 0);
+    // Exclude removed items from count
+    return orderItems
+      .filter(item => item.itemStatus !== 'removed')
+      .reduce((total, item) => total + item.quantity, 0);
   };
 
   const getItemTotal = (item: OrderItem) => {
@@ -311,10 +524,13 @@ export default function OrderScreen() {
   };
 
   const getTotalOrderCost = () => {
-    return orderItems.reduce((total, item) => {
-      const price = (item.product as any)?.price ? Number((item.product as any).price) : 0;
-      return total + price * item.quantity;
-    }, 0);
+    // Exclude removed items from total
+    return orderItems
+      .filter(item => item.itemStatus !== 'removed')
+      .reduce((total, item) => {
+        const price = (item.product as any)?.price ? Number((item.product as any).price) : 0;
+        return total + price * item.quantity;
+      }, 0);
   };
 
   const updateBillNumber = async (currentSequenceNumber?: number) => {
@@ -401,6 +617,7 @@ export default function OrderScreen() {
           style: 'destructive',
           onPress: () => {
             setOrderItems([]);
+            setOriginalSubmittedItems([]);
             // Reset bill number if it was fetched
             if (!existingBillId) {
               setBillNumber(null);
@@ -457,6 +674,7 @@ export default function OrderScreen() {
                 Alert.alert('Success', 'Order cancelled successfully!');
                 // Clear order list
                 setOrderItems([]);
+                setOriginalSubmittedItems([]);
                 setBillNumber(null);
                 setSequenceNumber(0);
                 setExistingBillId(null);
@@ -575,6 +793,7 @@ export default function OrderScreen() {
         
         // Clear order list so new order can be made
         setOrderItems([]);
+        setOriginalSubmittedItems([]);
         setBillNumber(null);
         setSequenceNumber(0);
         setExistingBillId(null);
@@ -671,12 +890,228 @@ export default function OrderScreen() {
         console.log('Submit KOT: Updating bill number sequence...');
         await updateBillNumber(fetchedSequenceNumber);
         
+        // Mark all items as original and store them
+        const originalItems = orderItems.map(item => ({
+          ...item,
+          itemStatus: 'original' as ItemStatus
+        }));
+        setOrderItems(originalItems);
+        setOriginalSubmittedItems(originalItems);
+        
         // Refetch the order to show the submitted order
         await fetchLastOrder();
       }
     } catch (err: any) {
       console.error('Error creating bill:', err);
       Alert.alert('Failed to create bill', err.response?.data?.message || err.message || 'Unknown error');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const updateKOT = async () => {
+    // Wait for IP to finish loading before checking
+    if (isLoadingIp) {
+      return;
+    }
+    if (!apiUrl) {
+      Alert.alert('Error', 'Server IP not configured. Please login first.');
+      return;
+    }
+    if (!tableNumber) {
+      Alert.alert('Select Table', 'Please select a table before updating KOT.');
+      return;
+    }
+    if (!existingBillId) {
+      Alert.alert('Error', 'No existing order found. Please submit a new order first.');
+      return;
+    }
+
+    try {
+      setLoading(true);
+      const token = await AsyncStorage.getItem('token');
+      const userId = await AsyncStorage.getItem('userId'); // Get userId if stored
+
+      // Fetch current bill to get existing items
+      const billResponse = await axios.post(
+        `${apiUrl}/api/bill/getTableStatus`,
+        { tableNumber },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+        }
+      );
+
+      if (billResponse.data.status !== 'success' || !billResponse.data.data) {
+        throw new Error('Could not fetch current bill');
+      }
+
+      const currentBill = billResponse.data.data;
+
+      // Identify added items (addons)
+      const addedItems = orderItems
+        .filter(item => item.itemStatus === 'addon' && item.quantity > 0)
+        .map((item) => {
+          const price = (item.product as any)?.price ? Number((item.product as any).price) : 0;
+          return {
+            productId: item.product._id,
+            name: item.product.name,
+            quantity: item.quantity,
+            price: price,
+          };
+        });
+
+      // Identify edited items (original items with quantity changes or removed)
+      const editedItems: Array<{
+        itemId: string;
+        newQuantity: number;
+        changeType: 'edit' | 'canceled';
+      }> = [];
+
+      // Only process active items from server (skip already canceled items)
+      currentBill.items
+        .filter((billItem: any) => billItem.status !== 'canceled')
+        .forEach((billItem: any) => {
+          const itemId = billItem._id;
+          const productId = billItem.productId?._id || billItem.productId;
+          
+          // Check if item was removed in current session
+          const removedItem = orderItems.find(
+            item => item.product._id === productId && item.itemStatus === 'removed'
+          );
+          
+          if (removedItem) {
+            editedItems.push({
+              itemId,
+              newQuantity: 0,
+              changeType: 'canceled',
+            });
+          } else {
+            // Check if quantity changed - find the original item (not addon)
+            const currentItem = orderItems.find(
+              item => item.product._id === productId && item.itemStatus === 'original'
+            );
+            
+            // Only update if quantity actually changed
+            if (currentItem && currentItem.quantity !== billItem.quantity) {
+              editedItems.push({
+                itemId,
+                newQuantity: currentItem.quantity,
+                changeType: 'edit',
+              });
+            }
+          }
+        });
+
+      // Check if there are any changes
+      const isCompleteOrder = !addedItems.length && !editedItems.length;
+
+      // Map existing items with their updates (following web app logic)
+      const updatedExistingItems = currentBill.items.map((item: any) => {
+        const editedItem = editedItems.find((edit) => edit.itemId === item._id);
+        
+        if (editedItem) {
+          // Create new update record for the item
+          const newUpdate = {
+            changeType: editedItem.changeType,
+            quantity: Math.abs(editedItem.newQuantity - item.quantity),
+            timestamp: new Date().toISOString(),
+            updatedBy: userId || null,
+          };
+
+          // Return item with updates, maintaining zero quantity for canceled items
+          return {
+            ...item,
+            quantity: editedItem.newQuantity,
+            subtotal: editedItem.newQuantity * item.price,
+            updates: [...(item.updates || []), newUpdate],
+            // Keep canceled items with quantity 0
+            status: editedItem.changeType === 'canceled' ? 'canceled' : 'active',
+          };
+        }
+        return item;
+      });
+
+      // Keep canceled items in the array but with quantity 0
+      const processedItems = updatedExistingItems.map((item: any) =>
+        item.status === 'canceled' ? { ...item, quantity: 0, subtotal: 0 } : item
+      );
+
+      // Format new items with initial update records
+      const newItemsFormatted = addedItems.map((item) => {
+        const price = item.price;
+        return {
+          productId: {
+            _id: item.productId,
+            name: item.name,
+          },
+          quantity: item.quantity,
+          price: price,
+          subtotal: price * item.quantity,
+          status: 'active',
+          updates: [
+            {
+              changeType: 'add',
+              quantity: item.quantity,
+              timestamp: new Date().toISOString(),
+              updatedBy: userId || null,
+            },
+          ],
+        };
+      });
+
+      // Calculate total excluding canceled items
+      const newTotal = [...processedItems, ...newItemsFormatted].reduce(
+        (sum, item) => sum + (item.status !== 'canceled' ? item.quantity * item.price : 0),
+        0
+      );
+
+      // Prepare update data (following web app structure)
+      const updateData = {
+        _id: existingBillId,
+        items: [...processedItems, ...newItemsFormatted],
+        totalAmount: newTotal,
+        paymentMethod: currentBill.paymentMethod || 'cash',
+        orderType: currentBill.orderType || 'dine-in',
+        status: isCompleteOrder ? 'bill-printed' : currentBill.status,
+        sgst: currentBill.sgst || 0,
+        cgst: currentBill.cgst || 0,
+        customerName: currentBill.customerName || '',
+        customerPhone: currentBill.customerPhone || '',
+        updatedAt: new Date().toISOString(),
+      };
+
+      console.log('Update KOT: Sending update data:', JSON.stringify(updateData, null, 2));
+
+      const response = await axios.put(`${apiUrl}/api/bill/update`, updateData, {
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+      });
+
+      if (response.status === 200 || response.status === 201) {
+        Alert.alert('Success', 'KOT updated successfully!');
+        
+        // Update local state - mark addons as original, keep removed items for display
+        const updatedItems = orderItems.map(item => {
+          if (item.itemStatus === 'addon') {
+            return { ...item, itemStatus: 'original' as ItemStatus };
+          }
+          return item;
+        });
+
+        setOrderItems(updatedItems);
+        setOriginalSubmittedItems(updatedItems.filter(item => item.itemStatus === 'original' || !item.itemStatus));
+        
+        // Refetch the order to sync with server
+        await fetchLastOrder();
+      }
+    } catch (err: any) {
+      console.error('Error updating KOT:', err);
+      Alert.alert('Failed to update KOT', err.response?.data?.message || err.message || 'Unknown error');
     } finally {
       setLoading(false);
     }
@@ -811,39 +1246,157 @@ export default function OrderScreen() {
                 Order List ({getTotalItems()} items)
               </ThemedText>
             </View>
-            {orderItems.map((item) => (
-              <View key={item.product._id} style={styles.orderItem}>
-                <View style={styles.orderItemInfo}>
-                  <ThemedText style={styles.orderItemName}>{item.product.name}</ThemedText>
-                  <ThemedText style={styles.orderItemCategory}>
-                    {item.product.Basequantity}
-                  </ThemedText>
-                  <ThemedText style={styles.orderItemPrice}>
-                    ₹{((item.product as any)?.price ? Number((item.product as any).price) : 0).toFixed(2)} each
-                  </ThemedText>
+            {/* Original Items Section */}
+            {orderItems.some(item => item.itemStatus === 'original' || !item.itemStatus) && (
+              <View style={styles.orderSectionHeader}>
+                <ThemedText style={styles.orderSectionHeaderText}>Original Order</ThemedText>
+              </View>
+            )}
+            {orderItems
+              .map((item, originalIndex) => ({ item, originalIndex }))
+              .filter(({ item }) => item.itemStatus === 'original' || !item.itemStatus)
+              .map(({ item, originalIndex }) => (
+                <View key={`original-${item.product._id}-${originalIndex}`} style={styles.orderItem}>
+                  <View style={styles.orderItemInfo}>
+                    <ThemedText style={styles.orderItemName}>{item.product.name}</ThemedText>
+                    <ThemedText style={styles.orderItemCategory}>
+                      {item.product.Basequantity}
+                    </ThemedText>
+                    <ThemedText style={styles.orderItemPrice}>
+                      ₹{((item.product as any)?.price ? Number((item.product as any).price) : 0).toFixed(2)} each
+                    </ThemedText>
+                  </View>
+                  <View style={styles.orderItemRight}>
+                    <View style={styles.quantityControls}>
+                      <TouchableOpacity
+                        style={styles.quantityButton}
+                        onPress={() => {
+                          const lid = item.localId ?? orderItems.find(i => i.product._id === item.product._id && (i.itemStatus || 'original') === (item.itemStatus || 'original'))?.localId;
+                          if (lid) handleDecrementQuantity(lid);
+                        }}
+                      >
+                        <ThemedText style={styles.quantityButtonText}>-</ThemedText>
+                      </TouchableOpacity>
+                      <ThemedText style={styles.quantityText}>{item.quantity}</ThemedText>
+                      <TouchableOpacity
+                        style={[styles.quantityButton, { marginLeft: 16 }]}
+                        onPress={() => {
+                          const lid = item.localId ?? orderItems.find(i => i.product._id === item.product._id && (i.itemStatus || 'original') === (item.itemStatus || 'original'))?.localId;
+                          if (lid) handleIncrementQuantity(lid);
+                        }}
+                      >
+                        <ThemedText style={styles.quantityButtonText}>+</ThemedText>
+                      </TouchableOpacity>
+                    </View>
+                    <ThemedText style={styles.itemTotalText}>
+                      ₹{getItemTotal(item).toFixed(2)}
+                    </ThemedText>
+                  </View>
                 </View>
-                <View style={styles.orderItemRight}>
-                  <View style={styles.quantityControls}>
+              ))}
+
+            {/* Add-on Items Section */}
+            {orderItems.some(item => item.itemStatus === 'addon' && item.quantity > 0) && (
+              <View style={styles.orderSectionHeader}>
+                <ThemedText style={[styles.orderSectionHeaderText, { color: '#FF9500' }]}>
+                  Add-ons (New Items)
+                </ThemedText>
+              </View>
+            )}
+            {orderItems
+              .map((item, originalIndex) => ({ item, originalIndex }))
+              .filter(({ item }) => item.itemStatus === 'addon' && item.quantity > 0)
+              .map(({ item, originalIndex }) => (
+                <View key={`addon-${item.product._id}-${originalIndex}`} style={[styles.orderItem, styles.addonItem]}>
+                  <View style={styles.orderItemInfo}>
+                    <ThemedText style={styles.orderItemName}>{item.product.name}</ThemedText>
+                    <ThemedText style={styles.orderItemCategory}>
+                      {item.product.Basequantity}
+                    </ThemedText>
+                    <ThemedText style={styles.orderItemPrice}>
+                      ₹{((item.product as any)?.price ? Number((item.product as any).price) : 0).toFixed(2)} each
+                    </ThemedText>
+                  </View>
+                  <View style={styles.orderItemRight}>
+                    <View style={styles.quantityControls}>
+                      <TouchableOpacity
+                        style={styles.quantityButton}
+                        onPress={() => {
+                          const lid = item.localId ?? orderItems.find(i => i.product._id === item.product._id && (i.itemStatus || '') === 'addon')?.localId;
+                          if (lid) handleDecrementQuantity(lid);
+                        }}
+                      >
+                        <ThemedText style={styles.quantityButtonText}>-</ThemedText>
+                      </TouchableOpacity>
+                      <ThemedText style={styles.quantityText}>{item.quantity}</ThemedText>
+                      <TouchableOpacity
+                        style={[styles.quantityButton, { marginLeft: 16 }]}
+                        onPress={() => {
+                          const lid = item.localId ?? orderItems.find(i => i.product._id === item.product._id && (i.itemStatus || '') === 'addon')?.localId;
+                          if (lid) handleIncrementQuantity(lid);
+                        }}
+                      >
+                        <ThemedText style={styles.quantityButtonText}>+</ThemedText>
+                      </TouchableOpacity>
+                    </View>
+                    <ThemedText style={styles.itemTotalText}>
+                      ₹{getItemTotal(item).toFixed(2)}
+                    </ThemedText>
+                  </View>
+                </View>
+              ))}
+
+            {/* Removed Items Section */}
+            {orderItems.some(item => item.itemStatus === 'removed') && (
+              <View style={styles.orderSectionHeader}>
+                <ThemedText style={[styles.orderSectionHeaderText, { color: '#FF3B30' }]}>
+                  Removed Items
+                </ThemedText>
+              </View>
+            )}
+            {orderItems
+              .map((item, originalIndex) => ({ item, originalIndex }))
+              .filter(({ item }) => item.itemStatus === 'removed')
+              .map(({ item, originalIndex }) => (
+                <View key={`removed-${item.product._id}-${originalIndex}`} style={[styles.orderItem, styles.removedItem]}>
+                  <View style={styles.orderItemInfo}>
+                    <ThemedText style={[styles.orderItemName, styles.removedItemText]}>
+                      {item.product.name}
+                    </ThemedText>
+                    <ThemedText style={[styles.orderItemCategory, styles.removedItemText]}>
+                      {item.product.Basequantity}
+                    </ThemedText>
+                    <ThemedText style={[styles.orderItemPrice, styles.removedItemText]}>
+                      ₹{((item.product as any)?.price ? Number((item.product as any).price) : 0).toFixed(2)} each
+                    </ThemedText>
+                    <ThemedText style={styles.removedLabel}>
+                      Removed: {item.originalQuantity || 0} → 0
+                    </ThemedText>
+                  </View>
+                  <View style={styles.orderItemRight}>
+                    <View style={styles.quantityDisplay}>
+                      <ThemedText style={[styles.quantityText, styles.removedItemText]}>
+                        {item.quantity} / {item.originalQuantity || 0}
+                      </ThemedText>
+                    </View>
                     <TouchableOpacity
-                      style={styles.quantityButton}
-                      onPress={() => handleDecrementQuantity(item.product._id)}
+                      style={[styles.quantityButton, { backgroundColor: '#34C759', marginTop: 8 }]}
+                      onPress={() => {
+                        // Restore removed item by localId
+                        setOrderItems(
+                          orderItems.map(i =>
+                            i.localId === item.localId
+                              ? { ...i, quantity: item.originalQuantity || 1, itemStatus: 'original' as ItemStatus, originalQuantity: undefined }
+                              : i
+                          )
+                        );
+                      }}
                     >
-                      <ThemedText style={styles.quantityButtonText}>-</ThemedText>
-                    </TouchableOpacity>
-                    <ThemedText style={styles.quantityText}>{item.quantity}</ThemedText>
-                    <TouchableOpacity
-                      style={[styles.quantityButton, { marginLeft: 16 }]}
-                      onPress={() => handleIncrementQuantity(item.product._id)}
-                    >
-                      <ThemedText style={styles.quantityButtonText}>+</ThemedText>
+                      <ThemedText style={styles.quantityButtonText}>↻</ThemedText>
                     </TouchableOpacity>
                   </View>
-                  <ThemedText style={styles.itemTotalText}>
-                    ₹{getItemTotal(item).toFixed(2)}
-                  </ThemedText>
                 </View>
-              </View>
-            ))}
+              ))}
             {/* Total Order Cost */}
             <View style={styles.totalCostContainer}>
               <ThemedText type="defaultSemiBold" style={styles.totalCostLabel}>
@@ -903,9 +1456,7 @@ export default function OrderScreen() {
             {existingBillId ? (
               <TouchableOpacity
                 disabled={loading}
-                onPress={() => {
-                  Alert.alert('Update KOT', 'Update KOT action will be implemented.');
-                }}
+                onPress={updateKOT}
                 style={[
                   styles.submitButton,
                   loading ? { opacity: 0.6 } : null,
@@ -1265,6 +1816,46 @@ const styles = StyleSheet.create({
     minWidth: 30,
     textAlign: 'center',
     marginLeft: 16,
+  },
+  orderSectionHeader: {
+    marginTop: 16,
+    marginBottom: 8,
+    paddingBottom: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: '#D1D1D6',
+  },
+  orderSectionHeaderText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#007AFF',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  addonItem: {
+    backgroundColor: '#FFF4E6',
+    borderLeftWidth: 4,
+    borderLeftColor: '#FF9500',
+  },
+  removedItem: {
+    backgroundColor: '#FFEBEE',
+    borderLeftWidth: 4,
+    borderLeftColor: '#FF3B30',
+    opacity: 0.7,
+  },
+  removedItemText: {
+    textDecorationLine: 'line-through',
+    opacity: 0.6,
+  },
+  removedLabel: {
+    fontSize: 12,
+    color: '#FF3B30',
+    fontWeight: '600',
+    marginTop: 4,
+    fontStyle: 'italic',
+  },
+  quantityDisplay: {
+    alignItems: 'center',
+    marginBottom: 4,
   },
 });
 
