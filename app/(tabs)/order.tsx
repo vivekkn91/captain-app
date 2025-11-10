@@ -74,6 +74,8 @@ export default function OrderScreen() {
   const [loadingLastOrder, setLoadingLastOrder] = useState<boolean>(false);
   const [isLoadingIp, setIsLoadingIp] = useState(true);
   const [originalSubmittedItems, setOriginalSubmittedItems] = useState<OrderItem[]>([]); // Track items that were originally submitted to KOT
+  const [suppressRemovedAfterFetch, setSuppressRemovedAfterFetch] = useState(false);
+  const [hasPendingChanges, setHasPendingChanges] = useState(false);
 
   useEffect(() => {
     const loadApiUrl = async () => {
@@ -111,210 +113,127 @@ export default function OrderScreen() {
     }
   }, [selectedCategory, products]);
 
-  // Fetch last order for the table when tableNumber and apiUrl are available
-  const fetchLastOrder = useCallback(async () => {
-    if (!apiUrl || !tableNumber || isLoadingIp) return;
-    
-    setLoadingLastOrder(true);
+// Fetch last order for the table when tableNumber and apiUrl are available
+const fetchLastOrder = useCallback(async () => {
+  if (!apiUrl || !tableNumber || isLoadingIp) return;
+  
+  setLoadingLastOrder(true);
+  try {
+    const token = await AsyncStorage.getItem('token');
+    // Debug token presence (masked) to help diagnose 401s
     try {
-      const token = await AsyncStorage.getItem('token');
-      const response = await axios.post(
-        `${apiUrl}/api/bill/getTableStatus`,
-        { tableNumber },
-        {
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-          },
-        }
-      );
-
-      // Check if table has an active order
-      if (response.data.status === 'success' && response.data.data) {
-        const billData = response.data.data;
-        
-        // Only show orders with active statuses (pending, preparing, ready)
-        // Don't show cancelled or completed orders
-        const activeStatuses = ['pending', 'preparing', 'ready'];
-        if (!activeStatuses.includes(billData.status)) {
-          // Order is completed, cancelled, or bill-printed - treat as table-free
-          setExistingBillId(null);
-          setOrderItems([]);
-          return;
-        }
-        
-        // Set the existing bill ID and bill number
-        setExistingBillId(billData._id);
-        setBillNumber(billData.billNumber);
-        
-        // Map items from API response to OrderItem format
-        if (billData.items && Array.isArray(billData.items)) {
-          // Process all items - don't filter by status yet
-          const allItems = billData.items.filter((item: any) => item.productId);
-          
-          // Map to track items by product ID to handle potential duplicates from server
-          // Only merge if we have multiple active items with same product ID (addon scenario)
-          const itemsByProductId = new Map<string, OrderItem[]>();
-          
-          allItems.forEach((item: any) => {
-            const productId = item.productId;
-            // Handle different productId formats: string, object with _id, or nested object
-            let productIdString: string = '';
-            let productName: string = '';
-            let productCategoryId: string = '';
-            let productStatus: string = 'active';
-            let productBasequantity: number | string | undefined;
-            let productPrice: number | undefined;
-            
-            if (typeof productId === 'string') {
-              productIdString = productId;
-            } else if (productId && typeof productId === 'object') {
-              productIdString = productId._id || String(productId);
-              productName = productId.name || '';
-              productCategoryId = productId.category || '';
-              productStatus = productId.status || 'active';
-              productBasequantity = productId.Basequantity;
-              productPrice = productId.price;
-            } else {
-              console.warn('Skipping item with invalid productId:', item);
-              return;
-            }
-            
-            if (!productIdString) {
-              console.warn('Skipping item with invalid productId:', item);
-              return;
-            }
-            
-            // Try to find the product in the products list to get full category info
-            const existingProduct = products.find(p => p._id === productIdString);
-            
-            // Extract product info, preferring existing product data
-            const finalProductName = productName || existingProduct?.name || 'Unknown Product';
-            const finalProductCategoryId = productCategoryId || existingProduct?.category?._id || '';
-            const finalProductStatus = productStatus || existingProduct?.status || 'active';
-            const finalProductBasequantity = productBasequantity || existingProduct?.Basequantity;
-            const finalProductPrice = item.price || productPrice || existingProduct?.price;
-            
-            // If product exists in state, use it; otherwise create from API data
-            const product: Product = existingProduct || {
-              _id: productIdString,
-              name: finalProductName,
-              category: {
-                _id: finalProductCategoryId,
-                // Try to find category name from categories list
-                name: categories.find(c => c._id === finalProductCategoryId)?.name || '',
-              },
-              status: finalProductStatus,
-              Basequantity: finalProductBasequantity,
-              price: finalProductPrice,
-            };
-            
-            // Ensure price is set from API if not in product
-            if (!product.price && item.price) {
-              product.price = item.price;
-            }
-            
-            const isCanceled = item.status === 'canceled';
-            const orderItem: OrderItem = {
-              product,
-              quantity: item.quantity || 0,
-              itemStatus: isCanceled ? 'removed' as ItemStatus : 'original' as ItemStatus,
-            };
-            
-            // For canceled items, try to get original quantity from item updates
-            if (isCanceled) {
-              if (item.updates && item.updates.length > 0) {
-                // Find the canceled update - it should have the quantity that was canceled
-                const canceledUpdate = item.updates.find((update: any) => update.changeType === 'canceled');
-                if (canceledUpdate && canceledUpdate.quantity) {
-                  // The quantity in the canceled update is the original quantity before cancellation
-                  orderItem.originalQuantity = canceledUpdate.quantity;
-                } else {
-                  // If no canceled update found, try to sum all update quantities as fallback
-                  // This is not ideal but better than 0
-                  const totalFromUpdates = item.updates.reduce((sum: number, update: any) => {
-                    return sum + (update.quantity || 0);
-                  }, 0);
-                  orderItem.originalQuantity = totalFromUpdates || 1; // Default to 1 if we can't determine
-                }
-              } else {
-                // No updates available - this shouldn't happen for canceled items
-                // But if it does, default to 1
-                orderItem.originalQuantity = 1;
-              }
-            }
-            
-            // Group items by product ID
-            if (!itemsByProductId.has(productIdString)) {
-              itemsByProductId.set(productIdString, []);
-            }
-            itemsByProductId.get(productIdString)!.push(orderItem);
-          });
-          
-          // Aggregate server-side items per product into a single original entry
-          // This prevents duplicate lines for the same product while preserving
-          // the list of server-side item ids so we can perform deterministic
-          // updates later.
-          const mappedItems: OrderItem[] = [];
-
-          itemsByProductId.forEach((items, productId) => {
-            // Separate canceled and active items
-            const canceledItemsForProduct = items.filter(item => item.itemStatus === 'removed');
-            const activeItemsForProduct = items.filter(item => item.itemStatus !== 'removed' && item.quantity > 0);
-
-            // If there are canceled items, create a removed entry (keep originalQuantity)
-            if (canceledItemsForProduct.length > 0) {
-              const canceledTotal = canceledItemsForProduct.reduce((sum, it) => sum + (it.originalQuantity || it.quantity || 0), 0);
-              const prototype = canceledItemsForProduct[0];
-              mappedItems.push({
-                product: prototype.product,
-                quantity: 0,
-                itemStatus: 'removed',
-                originalQuantity: canceledTotal,
-                localId: prototype.localId ?? `srv-removed-${productId}-${Date.now()}`,
-                serverItemIds: canceledItemsForProduct.map((it: any) => (it as any)._id || (it as any).serverItemId).filter(Boolean),
-              });
-            }
-
-            if (activeItemsForProduct.length > 0) {
-              // Aggregate active quantities into one entry
-              const totalQty = activeItemsForProduct.reduce((sum, it) => sum + (it.quantity || 0), 0);
-              const prototype = activeItemsForProduct[0];
-              mappedItems.push({
-                product: prototype.product,
-                quantity: totalQty,
-                itemStatus: 'original',
-                localId: prototype.localId ?? `srv-${productId}-${Date.now()}`,
-                serverItemIds: activeItemsForProduct.map((it: any) => (it as any)._id || (it as any).serverItemId).filter(Boolean),
-              });
-            }
-          });
-
-          // Ensure every item has a stable localId for client-side operations
-          const mappedWithIds = mappedItems.map((m, idx) => ({
-            ...m,
-            localId: m.localId ?? `srv-${m.product._id}-${Date.now()}-${idx}`,
-          }));
-          setOrderItems(mappedWithIds);
-          setOriginalSubmittedItems(mappedWithIds.filter(item => item.itemStatus === 'original' || !item.itemStatus)); // Store original items for comparison
-        }
-      } else if (response.data.status === 'table-free') {
-        // Table is free, reset to empty state
-        setExistingBillId(null);
-        setOrderItems([]);
-        setOriginalSubmittedItems([]);
-        // Don't reset billNumber here, keep the new bill number for new orders
-      }
-    } catch (err: any) {
-      console.error('Error fetching last order:', err);
-      // Don't show alert, just log error - table might be free
-      setExistingBillId(null);
-      setOrderItems([]);
-      setOriginalSubmittedItems([]);
-    } finally {
-      setLoadingLastOrder(false);
+      const masked = token ? `${token.slice(0,6)}...${token.slice(-6)}` : 'none';
+      console.debug('fetchLastOrder: token (masked):', masked, 'apiUrl:', apiUrl);
+    } catch (e) {
+      console.debug('fetchLastOrder: token present:', !!token, 'apiUrl:', apiUrl);
     }
-  }, [apiUrl, tableNumber, products, categories, isLoadingIp]);
+    const response = await axios.post(
+      `${apiUrl}/api/bill/getTableStatus`,
+      { tableNumber },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+      }
+    );
+
+    // Check if table has an active order
+    if (response?.data && response.data.status === 'success' && response.data.data) {
+      const bill = response.data.data;
+     
+      setExistingBillId(bill._id || null);
+      setBillNumber(bill.billNumber || null);
+
+      // Map and aggregate server items by product to avoid duplicate UI rows
+      const items = bill.items || [];
+      const itemsByProduct = new Map<string, any[]>();
+      items.forEach((bi: any) => {
+        const pid = bi.productId?._id || bi.productId;
+        if (!pid) return;
+        if (!itemsByProduct.has(pid)) itemsByProduct.set(pid, []);
+        itemsByProduct.get(pid)!.push(bi);
+      });
+
+      const mappedItems: OrderItem[] = [];
+      itemsByProduct.forEach((group: any[], pid: string) => {
+        const active = group.filter(g => g.status !== 'canceled' && (g.quantity || 0) > 0);
+        const canceled = group.filter(g => g.status === 'canceled');
+
+        if (active.length > 0) {
+          const totalQty = active.reduce((s, it) => s + (it.quantity || 0), 0);
+          const proto = active[0];
+          mappedItems.push({
+            product: {
+              _id: pid,
+              name: proto.productId?.name || proto.name || '',
+              category: proto.productId?.category || { _id: '', name: '' },
+              status: proto.productId?.status || 'active',
+              price: proto.price || proto.productId?.price || 0,
+            } as Product,
+            quantity: totalQty,
+            itemStatus: 'original',
+            localId: `srv-${pid}`,
+            serverItemIds: active.map(a => a._id).filter(Boolean),
+            originalQuantity: totalQty,
+          });
+        }
+
+        if (canceled.length > 0) {
+          const canceledTotal = canceled.reduce((s, it) => s + (it.quantity || 0), 0);
+          const proto = canceled[0];
+          mappedItems.push({
+            product: {
+              _id: pid,
+              name: proto.productId?.name || proto.name || '',
+              category: proto.productId?.category || { _id: '', name: '' },
+              status: proto.productId?.status || 'active',
+              price: proto.price || proto.productId?.price || 0,
+            } as Product,
+            quantity: 0,
+            itemStatus: 'removed',
+            localId: `srv-removed-${pid}`,
+            serverItemIds: canceled.map(c => c._id).filter(Boolean),
+            originalQuantity: canceledTotal,
+          });
+        }
+      });
+
+      // Optionally suppress removed items right after an update
+      const finalMapped = suppressRemovedAfterFetch ? mappedItems.filter(i => i.itemStatus !== 'removed') : mappedItems;
+      setOrderItems(finalMapped.map((m, idx) => ({ ...m, localId: m.localId ?? `srv-${m.product._id}-${Date.now()}-${idx}` })));
+      setOriginalSubmittedItems(finalMapped.filter(i => i.itemStatus === 'original'));
+      if (suppressRemovedAfterFetch) setSuppressRemovedAfterFetch(false);
+    } else {
+      // No active bill for this table
+      setExistingBillId(null);
+    }
+  } catch (err: any) {
+    // Improved diagnostics for authorization issues
+    if (axios.isAxiosError(err)) {
+      console.error('Error fetching last order - axios error:', err.response?.status, err.response?.data || err.message);
+      if (err.response?.status === 401) {
+        // Token invalid or expired - clear stored token and redirect to login
+        console.warn('Authorization failed (401). Clearing token and redirecting to login.');
+        try {
+          await AsyncStorage.removeItem('token');
+        } catch (e) {
+          console.warn('Failed to remove token from storage:', e);
+        }
+        router.replace('/screens/LoginScreen');
+      }
+    } else {
+      console.error('Error fetching last order:', err);
+    }
+
+    // Reset local order state when fetch fails
+    setExistingBillId(null);
+    setOrderItems([]);
+    setOriginalSubmittedItems([]);
+  } finally {
+    setLoadingLastOrder(false);
+  }
+}, [apiUrl, tableNumber, products, categories, isLoadingIp]);
 
   useEffect(() => {
     // Fetch when tableNumber and apiUrl are available
@@ -323,6 +242,43 @@ export default function OrderScreen() {
       fetchLastOrder();
     }
   }, [apiUrl, tableNumber, products, categories, isLoadingIp, fetchLastOrder]);
+
+  // Clear previous table's order immediately when switching tables so UI
+  // doesn't show stale items while new table data is loading.
+  useEffect(() => {
+    // If tableNumber changes, clear previous table state immediately
+    setOrderItems([]);
+    setOriginalSubmittedItems([]);
+    setExistingBillId(null);
+    setBillNumber(null);
+    // Note: fetchLastOrder will run shortly after if apiUrl and tableNumber are present
+  }, [tableNumber]);
+
+  // Recompute whether there are pending changes compared to the last submitted originals
+  useEffect(() => {
+    const computePending = () => {
+      if (!existingBillId) {
+        // If no existing bill, any items present constitute pending changes
+        return orderItems.length > 0;
+      }
+
+      // Added items: any addon with qty > 0
+      const added = orderItems.some(i => i.itemStatus === 'addon' && i.quantity > 0);
+
+      // Removed or edited originals
+      const editedOriginals = originalSubmittedItems.some(orig => {
+        const current = orderItems.find(i => i.product._id === orig.product._id && (i.itemStatus === 'original' || !i.itemStatus));
+        const removed = orderItems.find(i => i.product._id === orig.product._id && i.itemStatus === 'removed');
+        if (removed) return true;
+        if (!current) return true; // original missing -> changed
+        return (current.quantity || 0) !== (orig.quantity || 0);
+      });
+
+      return added || editedOriginals;
+    };
+
+    setHasPendingChanges(computePending());
+  }, [orderItems, originalSubmittedItems, existingBillId]);
 
   // Refresh order when screen comes into focus
   useFocusEffect(
@@ -491,19 +447,59 @@ export default function OrderScreen() {
       return;
     }
     const target = orderItems[idx];
-
     const newItems = [...orderItems];
-    const newQuantity = target.quantity - 1;
+    const newQuantity = Math.max(0, target.quantity - 1);
 
-    if (newQuantity <= 0) {
-      const isOriginal = !target.itemStatus || target.itemStatus === 'original';
-      if (isOriginal && existingBillId) {
-        // mark as removed but keep in list
-        newItems[idx] = { ...target, quantity: 0, itemStatus: 'removed', originalQuantity: target.quantity };
+    const isOriginal = !target.itemStatus || target.itemStatus === 'original';
+
+    if (isOriginal && existingBillId) {
+      // For originals after KOT submission, each decrement should:
+      // - reduce the original item quantity shown
+      // - create/update a 'removed' entry that accumulates removed count
+
+      // previous quantity before decrement
+      const prevQty = target.quantity;
+      const removedDelta = prevQty - newQuantity; // normally 1
+
+      // Update the original item's visible remaining quantity
+      newItems[idx] = { ...target, quantity: newQuantity };
+
+      // Find existing removed entry for this product
+      const removedIdx = newItems.findIndex(i => i.product._id === target.product._id && i.itemStatus === 'removed');
+
+      // Determine original submitted amount (fallback to prevQty + existing removed quantity)
+      const origSubmitted = originalSubmittedItems.find(o => o.product._id === target.product._id);
+      const originalTotal = origSubmitted ? (origSubmitted.quantity || 0) : (prevQty + (removedIdx !== -1 ? (newItems[removedIdx].quantity || 0) : 0));
+
+      if (removedIdx !== -1) {
+        const existingRemoved = newItems[removedIdx];
+        const newRemovedQty = (existingRemoved.quantity || 0) + removedDelta;
+        newItems[removedIdx] = {
+          ...existingRemoved,
+          quantity: newRemovedQty,
+          originalQuantity: originalTotal,
+        };
       } else {
-        // remove the item entirely (addon or new order)
-        newItems.splice(idx, 1);
+        // create a removed entry with removed count
+        const removedItem: OrderItem = {
+          product: target.product,
+          quantity: removedDelta,
+          itemStatus: 'removed',
+          originalQuantity: originalTotal,
+          localId: `removed-${target.product._id}-${Date.now()}`,
+        };
+        newItems.push(removedItem);
       }
+
+      setOrderItems(newItems);
+      // mark pending changes
+      setHasPendingChanges(true);
+      return;
+    }
+
+    // Non-original items (addons or new unsent) behave as before
+    if (newQuantity <= 0) {
+      newItems.splice(idx, 1);
     } else {
       newItems[idx] = { ...target, quantity: newQuantity };
     }
@@ -807,6 +803,8 @@ export default function OrderScreen() {
   };
 
   const submitKOT = async () => {
+
+    
     // Wait for IP to finish loading before checking
     if (isLoadingIp) {
       return;
@@ -828,6 +826,7 @@ export default function OrderScreen() {
       // Fetch bill number only when submitting to KOT
       console.log('Submit KOT: Fetching bill number...');
       const fetchedBillData = await fetchBillNumber();
+      console.log(fetchedBillData,"my logs");
       if (!fetchedBillData || !fetchedBillData.billNumber) {
         Alert.alert('Error', 'Failed to fetch bill number. Please try again.');
         setLoading(false);
@@ -835,8 +834,7 @@ export default function OrderScreen() {
       }
       const fetchedBillNumber = fetchedBillData.billNumber;
       const fetchedSequenceNumber = fetchedBillData.sequenceNumber;
-      console.log('Submit KOT: Fetched bill number:', fetchedBillNumber);
-      console.log('Submit KOT: Fetched sequence number:', fetchedSequenceNumber);
+ 
       const sanitizedItems = orderItems.map((item) => {
         const price = (item.product as any)?.price ? Number((item.product as any).price) : 0;
         return {
@@ -964,51 +962,76 @@ export default function OrderScreen() {
         });
 
       // Identify edited items (original items with quantity changes or removed)
+      // We'll map desired quantities per product from the client and then
+      // distribute those desired quantities across the server-side bill items
+      // for that product so we update the exact server item ids (deterministic).
       const editedItems: Array<{
         itemId: string;
         newQuantity: number;
         changeType: 'edit' | 'canceled';
       }> = [];
 
-      // Only process active items from server (skip already canceled items)
-      currentBill.items
-        .filter((billItem: any) => billItem.status !== 'canceled')
-        .forEach((billItem: any) => {
-          const itemId = billItem._id;
-          const productId = billItem.productId?._id || billItem.productId;
-          
-          // Check if item was removed in current session
-          const removedItem = orderItems.find(
-            item => item.product._id === productId && item.itemStatus === 'removed'
-          );
-          
-          if (removedItem) {
-            editedItems.push({
-              itemId,
-              newQuantity: 0,
-              changeType: 'canceled',
-            });
+      // Build desired quantity map per product from client state
+      const desiredByProduct = new Map<string, number>();
+      orderItems.forEach(oi => {
+        const pid = oi.product._id;
+        if (oi.itemStatus === 'original' || !oi.itemStatus) {
+          desiredByProduct.set(pid, oi.quantity || 0);
+        } else if (oi.itemStatus === 'removed') {
+          // If there's a removed entry but no explicit original entry, derive remaining from originalSubmittedItems
+          const orig = orderItems.find(i => i.product._id === pid && (i.itemStatus === 'original' || !i.itemStatus));
+          if (orig) {
+            desiredByProduct.set(pid, orig.quantity || 0);
           } else {
-            // Check if quantity changed - find the original item (not addon)
-            const currentItem = orderItems.find(
-              item => item.product._id === productId && item.itemStatus === 'original'
-            );
-            
-            // Only update if quantity actually changed
-            if (currentItem && currentItem.quantity !== billItem.quantity) {
-              editedItems.push({
-                itemId,
-                newQuantity: currentItem.quantity,
-                changeType: 'edit',
-              });
-            }
+            const submitted = originalSubmittedItems.find(o => o.product._id === pid);
+            const remaining = Math.max(0, (submitted?.quantity || 0) - (oi.quantity || 0));
+            desiredByProduct.set(pid, remaining);
           }
-        });
+        }
+      });
+
+      // Group server bill items by product
+      const serverItemsByProduct = new Map<string, any[]>();
+      currentBill.items.forEach((bi: any) => {
+        const pid = bi.productId?._id || bi.productId;
+        if (!pid) return;
+        if (!serverItemsByProduct.has(pid)) serverItemsByProduct.set(pid, []);
+        serverItemsByProduct.get(pid)!.push(bi);
+      });
+
+      // For each product present on the server, compute the new per-server-item quantities
+      serverItemsByProduct.forEach((serverItems, pid) => {
+        // Only consider active server items (skip already canceled)
+        const activeServerItems = serverItems.filter((s: any) => s.status !== 'canceled');
+        const desired = desiredByProduct.has(pid) ? desiredByProduct.get(pid)! : null;
+
+        // If desired is null, we still may not need to edit these items (no change)
+        if (desired === null) {
+          return;
+        }
+
+        let remaining = desired;
+        // Distribute remaining desired quantity into existing server items
+        for (const sItem of activeServerItems) {
+          const origQty = sItem.quantity || 0;
+          const assign = Math.min(origQty, remaining);
+          if (assign !== origQty) {
+            editedItems.push({
+              itemId: sItem._id,
+              newQuantity: assign,
+              changeType: assign === 0 ? 'canceled' : 'edit',
+            });
+          }
+          remaining = Math.max(0, remaining - assign);
+        }
+        // If remaining > 0, those extra quantities will be handled as addedItems (addons) elsewhere
+      });
 
       // Check if there are any changes
       const isCompleteOrder = !addedItems.length && !editedItems.length;
 
-      // Map existing items with their updates (following web app logic)
+  console.debug('Update KOT: computed editedItems:', JSON.stringify(editedItems, null, 2));
+  // Map existing items with their updates (following web app logic)
       const updatedExistingItems = currentBill.items.map((item: any) => {
         const editedItem = editedItems.find((edit) => edit.itemId === item._id);
         
@@ -1096,17 +1119,18 @@ export default function OrderScreen() {
         Alert.alert('Success', 'KOT updated successfully!');
         
         // Update local state - mark addons as original, keep removed items for display
-        const updatedItems = orderItems.map(item => {
-          if (item.itemStatus === 'addon') {
-            return { ...item, itemStatus: 'original' as ItemStatus };
-          }
-          return item;
-        });
+        const updatedItems = orderItems
+          .map(item => item.itemStatus === 'addon' ? { ...item, itemStatus: 'original' as ItemStatus } : item)
+          // remove local 'removed' entries after update so UI shows only updated originals
+          .filter(item => item.itemStatus !== 'removed');
 
         setOrderItems(updatedItems);
         setOriginalSubmittedItems(updatedItems.filter(item => item.itemStatus === 'original' || !item.itemStatus));
-        
-        // Refetch the order to sync with server
+        // Mark no pending changes now
+        setHasPendingChanges(false);
+        // Suppress removed items from next fetch so UI reflects updated originals only
+        setSuppressRemovedAfterFetch(true);
+        // Refetch the order to sync with server (this will respect suppression)
         await fetchLastOrder();
       }
     } catch (err: any) {
@@ -1370,7 +1394,7 @@ export default function OrderScreen() {
                       ₹{((item.product as any)?.price ? Number((item.product as any).price) : 0).toFixed(2)} each
                     </ThemedText>
                     <ThemedText style={styles.removedLabel}>
-                      Removed: {item.originalQuantity || 0} → 0
+                      Removed: {item.quantity || 0} / {item.originalQuantity || 0}
                     </ThemedText>
                   </View>
                   <View style={styles.orderItemRight}>
@@ -1455,7 +1479,7 @@ export default function OrderScreen() {
             {/* Submit to KOT Button */}
             {existingBillId ? (
               <TouchableOpacity
-                disabled={loading}
+                disabled={loading || !hasPendingChanges}
                 onPress={updateKOT}
                 style={[
                   styles.submitButton,
