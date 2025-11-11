@@ -73,6 +73,8 @@ export default function OrderScreen() {
   const [existingBillId, setExistingBillId] = useState<string | null>(null);
   const [loadingLastOrder, setLoadingLastOrder] = useState<boolean>(false);
   const [isLoadingIp, setIsLoadingIp] = useState(true);
+  const [taxSettings, setTaxSettings] = useState<{ cgst: number; sgst: number; fssaiNumber?: string }>({ cgst: 0, sgst: 0 });
+  const [taxLoading, setTaxLoading] = useState<boolean>(false);
   const [originalSubmittedItems, setOriginalSubmittedItems] = useState<OrderItem[]>([]); // Track items that were originally submitted to KOT
   const [suppressRemovedAfterFetch, setSuppressRemovedAfterFetch] = useState(false);
   const [hasPendingChanges, setHasPendingChanges] = useState(false);
@@ -234,6 +236,42 @@ const fetchLastOrder = useCallback(async () => {
     setLoadingLastOrder(false);
   }
 }, [apiUrl, tableNumber, products, categories, isLoadingIp]);
+
+  // Fetch tax settings from server when apiUrl available
+  const fetchTaxSettings = useCallback(async () => {
+    if (!apiUrl) return;
+    setTaxLoading(true);
+    try {
+      const token = await AsyncStorage.getItem('token');
+      const response = await axios.get(`${apiUrl}/api/tax/tax-get-settings`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      if (response.status === 200 && response.data) {
+        const ts = response.data.taxSettings || response.data;
+        setTaxSettings({
+          cgst: parseFloat(ts.cgst) || 0,
+          sgst: parseFloat(ts.sgst) || 0,
+          fssaiNumber: ts.fssaiNumber || ts.fssai || '',
+        });
+      }
+    } catch (err: unknown) {
+      // Narrow the error safely: handle axios errors separately and fallback to generic message
+      if (axios.isAxiosError(err)) {
+        console.warn('Failed to fetch tax settings (axios):', err.response?.data || err.message || err);
+      } else {
+        const e = err as any;
+        console.warn('Failed to fetch tax settings:', e?.message || e);
+      }
+    } finally {
+      setTaxLoading(false);
+    }
+  }, [apiUrl]);
+
+  useEffect(() => {
+    if (apiUrl) fetchTaxSettings();
+  }, [apiUrl, fetchTaxSettings]);
 
   useEffect(() => {
     // Fetch when tableNumber and apiUrl are available
@@ -529,6 +567,15 @@ const fetchLastOrder = useCallback(async () => {
       }, 0);
   };
 
+  // Compute tax amounts and payable amount for a given subtotal
+  const computeTaxAmounts = (subtotal: number) => {
+    const sgstAmount = (subtotal * (taxSettings.sgst || 0)) / 100;
+    const cgstAmount = (subtotal * (taxSettings.cgst || 0)) / 100;
+    const totalWithTax = subtotal + sgstAmount + cgstAmount;
+    const payableAmount = Math.floor(totalWithTax);
+    return { sgstAmount, cgstAmount, totalWithTax, payableAmount };
+  };
+
   const updateBillNumber = async (currentSequenceNumber?: number) => {
     if (!apiUrl) return false;
     try {
@@ -752,20 +799,21 @@ const fetchLastOrder = useCallback(async () => {
         });
 
         const totalAmount = getTotalOrderCost();
-        const billData = {
-          billNumber: fetchedBillNumber,
-          paymentMethod: 'cash',
-          status: 'completed', // Directly set as completed
-          orderType: 'dine-in',
-          tableNumber: tableNumber,
-          table: tableNumber,
-          items: sanitizedItems,
-          totalAmount: totalAmount,
-          cgst: 0,
-          sgst: 0,
-          payableAmount: totalAmount,
-          date: new Date().toISOString(),
-        };
+          const { sgstAmount, cgstAmount, totalWithTax, payableAmount } = computeTaxAmounts(totalAmount);
+          const billData = {
+            billNumber: fetchedBillNumber,
+            paymentMethod: 'cash',
+            status: 'completed', // Directly set as completed
+            orderType: 'dine-in',
+            tableNumber: tableNumber,
+            table: tableNumber,
+            items: sanitizedItems,
+            totalAmount: totalAmount,
+            cgst: cgstAmount,
+            sgst: sgstAmount,
+            payableAmount: payableAmount,
+            date: new Date().toISOString(),
+          };
 
         console.log('Complete Order: Creating new bill with status completed:', JSON.stringify(billData, null, 2));
         console.log('Complete Order: Bill number being submitted:', fetchedBillNumber);
@@ -848,6 +896,7 @@ const fetchLastOrder = useCallback(async () => {
       });
 
       const totalAmount = getTotalOrderCost();
+      const { sgstAmount, cgstAmount, totalWithTax, payableAmount } = computeTaxAmounts(totalAmount);
       const billData = {
         billNumber: fetchedBillNumber,
         paymentMethod: 'cash',
@@ -857,9 +906,9 @@ const fetchLastOrder = useCallback(async () => {
         table: tableNumber,
         items: sanitizedItems,
         totalAmount: totalAmount,
-        cgst: 0,
-        sgst: 0,
-        payableAmount: totalAmount,
+        cgst: cgstAmount,
+        sgst: sgstAmount,
+        payableAmount: payableAmount,
         date: new Date().toISOString(),
       };
 
@@ -1085,22 +1134,28 @@ const fetchLastOrder = useCallback(async () => {
         };
       });
 
-      // Calculate total excluding canceled items
+      // Calculate total excluding canceled items (subtotal)
       const newTotal = [...processedItems, ...newItemsFormatted].reduce(
         (sum, item) => sum + (item.status !== 'canceled' ? item.quantity * item.price : 0),
         0
       );
 
+      // Compute taxes based on configured tax percentages
+      const { sgstAmount, cgstAmount, totalWithTax, payableAmount } = computeTaxAmounts(newTotal);
+
       // Prepare update data (following web app structure)
       const updateData = {
         _id: existingBillId,
         items: [...processedItems, ...newItemsFormatted],
+        // totalAmount is the subtotal (before taxes)
         totalAmount: newTotal,
         paymentMethod: currentBill.paymentMethod || 'cash',
         orderType: currentBill.orderType || 'dine-in',
         status: isCompleteOrder ? 'bill-printed' : currentBill.status,
-        sgst: currentBill.sgst || 0,
-        cgst: currentBill.cgst || 0,
+        // attach computed tax amounts
+        sgst: sgstAmount,
+        cgst: cgstAmount,
+        payableAmount: payableAmount,
         customerName: currentBill.customerName || '',
         customerPhone: currentBill.customerPhone || '',
         updatedAt: new Date().toISOString(),
@@ -1140,6 +1195,9 @@ const fetchLastOrder = useCallback(async () => {
       setLoading(false);
     }
   };
+
+  const subtotal = getTotalOrderCost();
+  const { sgstAmount, cgstAmount, totalWithTax, payableAmount } = computeTaxAmounts(subtotal);
 
   return (
     <ThemedView style={styles.container}>
@@ -1421,10 +1479,25 @@ const fetchLastOrder = useCallback(async () => {
                   </View>
                 </View>
               ))}
-            {/* Total Order Cost */}
+            {/* Total Order Cost + Taxes */}
             <View style={styles.totalCostContainer}>
               <ThemedText type="defaultSemiBold" style={styles.totalCostLabel}>
-                Total: ₹{getTotalOrderCost().toFixed(2)}
+                Subtotal: ₹{subtotal.toFixed(2)}
+              </ThemedText>
+
+              <View style={{ marginTop: 6, width: '100%' }}>
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
+                  <ThemedText style={[styles.totalCostLabel, { fontSize: 14, fontWeight: '400' }]}>SGST ({taxSettings.sgst}%):</ThemedText>
+                  <ThemedText style={[styles.totalCostLabel, { fontSize: 14, fontWeight: '400' }]}>₹{sgstAmount.toFixed(2)}</ThemedText>
+                </View>
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 4 }}>
+                  <ThemedText style={[styles.totalCostLabel, { fontSize: 14, fontWeight: '400' }]}>CGST ({taxSettings.cgst}%):</ThemedText>
+                  <ThemedText style={[styles.totalCostLabel, { fontSize: 14, fontWeight: '400' }]}>₹{cgstAmount.toFixed(2)}</ThemedText>
+                </View>
+              </View>
+
+              <ThemedText type="defaultSemiBold" style={[styles.totalCostLabel, { marginTop: 8 }]}>
+                Payable: ₹{payableAmount.toFixed(2)}
               </ThemedText>
             </View>
             
@@ -1478,23 +1551,28 @@ const fetchLastOrder = useCallback(async () => {
 
             {/* Submit to KOT Button */}
             {existingBillId ? (
-              <TouchableOpacity
-                disabled={loading || !hasPendingChanges}
-                onPress={updateKOT}
-                style={[
-                  styles.submitButton,
-                  loading ? { opacity: 0.6 } : null,
-                  { backgroundColor: '#FF9500' },
-                ]}
-              >
-                {loading ? (
-                  <ActivityIndicator color="#fff" />
-                ) : (
-                  <ThemedText style={styles.submitButtonText}>
-                    {`Update KOT ${billNumber ? `(Bill ${billNumber})` : ''}`}
-                  </ThemedText>
-                )}
-              </TouchableOpacity>
+              (() => {
+                const isDisabled = loading || !hasPendingChanges;
+                return (
+                  <TouchableOpacity
+                    disabled={isDisabled}
+                    onPress={updateKOT}
+                    style={[
+                      styles.submitButton,
+                      isDisabled ? { backgroundColor: '#BDBDBD' } : { backgroundColor: '#FF9500' },
+                      loading ? { opacity: 0.6 } : null,
+                    ]}
+                  >
+                    {loading ? (
+                      <ActivityIndicator color="#fff" />
+                    ) : (
+                      <ThemedText style={styles.submitButtonText}>
+                        {`Update KOT ${billNumber ? `(Bill ${billNumber})` : ''}`}
+                      </ThemedText>
+                    )}
+                  </TouchableOpacity>
+                );
+              })()
             ) : (
               <TouchableOpacity
                 disabled={loading || billNumberLoading || orderItems.length === 0}
