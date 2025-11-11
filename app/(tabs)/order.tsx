@@ -1478,23 +1478,28 @@ const fetchLastOrder = useCallback(async () => {
 
             {/* Submit to KOT Button */}
             {existingBillId ? (
-              <TouchableOpacity
-                disabled={loading || !hasPendingChanges}
-                onPress={updateKOT}
-                style={[
-                  styles.submitButton,
-                  loading ? { opacity: 0.6 } : null,
-                  { backgroundColor: '#FF9500' },
-                ]}
-              >
-                {loading ? (
-                  <ActivityIndicator color="#fff" />
-                ) : (
-                  <ThemedText style={styles.submitButtonText}>
-                    {`Update KOT ${billNumber ? `(Bill ${billNumber})` : ''}`}
-                  </ThemedText>
-                )}
-              </TouchableOpacity>
+              (() => {
+                const isDisabled = loading || !hasPendingChanges;
+                return (
+                  <TouchableOpacity
+                    disabled={isDisabled}
+                    onPress={updateKOT}
+                    style={[
+                      styles.submitButton,
+                      isDisabled ? { backgroundColor: '#BDBDBD' } : { backgroundColor: '#FF9500' },
+                      loading ? { opacity: 0.6 } : null,
+                    ]}
+                  >
+                    {loading ? (
+                      <ActivityIndicator color="#fff" />
+                    ) : (
+                      <ThemedText style={styles.submitButtonText}>
+                        {`Update KOT ${billNumber ? `(Bill ${billNumber})` : ''}`}
+                      </ThemedText>
+                    )}
+                  </TouchableOpacity>
+                );
+              })()
             ) : (
               <TouchableOpacity
                 disabled={loading || billNumberLoading || orderItems.length === 0}

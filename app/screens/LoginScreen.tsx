@@ -131,8 +131,14 @@ export default function LoginScreen() {
       const data = await response.json();
       console.log("Response:", data);
 
+     
+
       if (!response.ok) {
         Alert.alert("Login Failed", data.msg || "Invalid credentials");
+        return;
+      }
+       if (data.user.employeeType !== "staff") {
+        Alert.alert("Login Failed", "Only staff account can login");
         return;
       }
 
